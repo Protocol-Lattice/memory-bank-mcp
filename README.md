@@ -35,13 +35,5 @@ Minimal, production-ready **Model Context Protocol (MCP)** server that provides 
 ## Quick start
 
 ```bash
-# clone
-git clone https://github.com/Protocol-Lattice/memory-bank-mcp
-cd memory-bank-mcp
-
-# tidy & build
-go mod tidy
-go build -o memory-bank-mcp
-
-# run (stdio mode; MCP client will manage the process)
-./memory-bank-mcp
+go install github.com/Protocol-Lattice/memory-bank-mcp@latest
+```
