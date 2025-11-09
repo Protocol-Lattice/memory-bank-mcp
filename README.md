@@ -100,5 +100,17 @@ The server exposes a comprehensive set of tools for memory manipulation.
 - `shared.add_short_to`: Add a short-term memory directly to a shared space.
 - `shared.retrieve`: Retrieve memories from a principal's merged view (local + joined spaces).
 
+## MCP Configuration:
+```
+{
+	"servers": {
+    "memory-bank": {
+      "command": "/usr/local/bin/memory-bank-mcp",
+      "args": ["-transport", "http", "-addr", ":8080"]
+    }
+	},
+	"inputs": []
+}
+```
 ### Diagnostics
 - `engine.metrics`: Get a snapshot of the memory engine's performance metrics.
