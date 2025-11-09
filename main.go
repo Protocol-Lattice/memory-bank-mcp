@@ -284,56 +284,57 @@ func main() {
 		mcp.WithString("content", mcp.Required(), mcp.Description("New content to store and embed")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Semantic query for retrieval")),
 		mcp.WithNumber("limit", mcp.Description("Number of memories to retrieve")),
+		mcp.WithString("include_contents", mcp.Description("Include raw file contents in prompt output")),
 	)
+
 	s.AddTool(chainPrompt, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sid, err := req.RequireString("session_id")
-		if err != nil {
-			return mcp.NewToolResultError("missing session_id"), nil
-		}
-		content, err := req.RequireString("content")
-		if err != nil {
-			return mcp.NewToolResultError("missing content"), nil
-		}
-		query, err := req.RequireString("query")
-		if err != nil {
-			return mcp.NewToolResultError("missing query"), nil
-		}
+		sid, _ := req.RequireString("session_id")
+		content, _ := req.RequireString("content")
+		query, _ := req.RequireString("query")
+
 		limit := int(getNumberParam(req, "limit"))
 		if limit <= 0 {
 			limit = 5
 		}
 
-		// Step 1: Embed content
 		e, err := app.sm.Embed(ctx, content)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("embed failed: %v", err)), nil
 		}
 
-		// Step 2: Add short-term memory
-		// (AddShortTerm returns nothing)
-		synthesized := fmt.Sprintf("%s\n\n[Generated Response]\n%s", query, content)
-		app.sm.AddShortTerm(sid, synthesized, "{}", e)
-		app.sm.FlushToLongTerm(ctx, sid)
-		// Step 3: Flush to long-term memory
+		app.sm.AddShortTerm(sid, content, "{}", e)
 		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("flush failed: %v", err)), nil
 		}
 
-		// Step 4: Retrieve top related memories
 		recs, err := app.sm.RetrieveContext(ctx, sid, query, limit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("retrieve failed: %v", err)), nil
 		}
 
-		// Step 5: Build LLM-ready prompt
-		var ctxLines []string
-		for i, r := range recs {
-			ctxLines = append(ctxLines, fmt.Sprintf("%d. %s", i+1, r.Content))
-		}
-		prompt := fmt.Sprintf("[Context Memories]\n%s\n\n[User Input]\n%s",
-			strings.Join(ctxLines, "\n"), content)
+		includeContents := strings.ToLower(getStringParam(req, "include_contents")) == "true"
 
-		// Step 6: Return structured output
+		var ctxLines []string
+		if includeContents {
+			for i, r := range recs {
+				path := ""
+				var meta map[string]any
+				if err := json.Unmarshal([]byte(r.Metadata), &meta); err == nil {
+					if p, ok := meta["path"]; ok {
+						path = fmt.Sprintf("[%v]", p)
+					}
+				}
+				ctxLines = append(ctxLines, fmt.Sprintf("%d. %s\n%s", i+1, path, r.Content))
+			}
+		} else {
+			for i, r := range recs {
+				ctxLines = append(ctxLines, fmt.Sprintf("%d. %s", i+1, r.Content))
+			}
+		}
+
+		prompt := fmt.Sprintf("[Context Files]\n%s\n\n[User Input]\n%s",
+			strings.Join(ctxLines, "\n\n"), content)
+
 		out := map[string]any{
 			"embedding": e,
 			"records":   recs,
