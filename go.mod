@@ -1,5 +1,4 @@
 module github.com/Protocol-Lattice/memory-bank-mcp
-
 go 1.25.0
 
 require (
