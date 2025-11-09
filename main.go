@@ -157,8 +157,11 @@ func main() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		res, _ := mcp.NewToolResultJSON(e)
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"embedding": e,
+		})
 		return res, nil
+
 	})
 
 	// ---- Tool: memory.add_short(session_id, content, metadata_json) ----
@@ -268,7 +271,73 @@ func main() {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		res, _ := mcp.NewToolResultJSON(recs)
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"records": recs,
+		})
+		return res, nil
+
+	})
+	chainPrompt := mcp.NewTool("memory.chain_prompt",
+		mcp.WithDescription("Embed, store, flush, retrieve, and return a prompt with context memories"),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("content", mcp.Required()),
+		mcp.WithString("query", mcp.Required()),
+		mcp.WithNumber("limit"),
+	)
+	s.AddTool(chainPrompt, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, err := req.RequireString("session_id")
+		if err != nil {
+			return mcp.NewToolResultError("missing session_id"), nil
+		}
+		content, err := req.RequireString("content")
+		if err != nil {
+			return mcp.NewToolResultError("missing content"), nil
+		}
+		query, err := req.RequireString("query")
+		if err != nil {
+			return mcp.NewToolResultError("missing query"), nil
+		}
+		limit := int(getNumberParam(req, "limit"))
+		if limit <= 0 {
+			limit = 5
+		}
+
+		// Step 1: Embed content
+		e, err := app.sm.Embed(ctx, content)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("embed failed: %v", err)), nil
+		}
+
+		// Step 2: Add short-term memory
+		app.sm.AddShortTerm(sid, content, "{}", e)
+
+		// Step 3: Flush short-term to long-term
+		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("flush failed: %v", err)), nil
+		}
+
+		// Step 4: Retrieve related memories
+		recs, err := app.sm.RetrieveContext(ctx, sid, query, limit)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("retrieve failed: %v", err)), nil
+		}
+
+		// Step 5: Build a context prompt
+		var ctxLines []string
+		for i, r := range recs {
+			ctxLines = append(ctxLines, fmt.Sprintf("%d. %s", i+1, r.Content))
+		}
+		promptText := fmt.Sprintf("[Context Memories]\n%s\n\n[User Input]\n%s",
+			strings.Join(ctxLines, "\n"), content)
+
+		// Step 6: Return both structured data and ready-to-use text
+		out := map[string]any{
+			"embedding": e,
+			"records":   recs,
+			"prompt":    promptText,
+		}
+
+		res, _ := mcp.NewToolResultJSON(out)
 		return res, nil
 	})
 
