@@ -1,396 +1,535 @@
-// path: main.go
+// main.go
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	// MCP server + types
+	memory "github.com/Protocol-Lattice/go-agent/src/memory"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-
-	// Memory engine (wired but currently optional to run)
-	mem "github.com/Protocol-Lattice/go-agent/src/memory"
 )
 
-// -----------------------------------------------------------------------------
-// Very small, safe in-process memory layer
-// -----------------------------------------------------------------------------
-//
-// Notes:
-// - This file compiles cleanly against github.com/mark3labs/mcp-go v0.43+
-//   and github.com/Protocol-Lattice/go-agent v0.6+.
-// - It exposes an MCP server with a few memory-oriented tools.
-// - It also wires the Protocol-Lattice memory engine (in-memory store + embedder)
-//   so you can switch storage/recall paths to mem.SessionMemory later.
-// - The initial storage below is a minimal, concurrency-safe ring buffer per (session, space)
-//   to make the server usable immediately. Swap the calls in the handlers where marked
-//   with the go-agent memory engine if/when you’re ready.
-
-type Message struct {
-	Ts      time.Time         `json:"ts"`
-	Role    string            `json:"role"`    // "user" | "agent" | "system"
-	Content string            `json:"content"` // raw text
-	Meta    map[string]any    `json:"meta,omitempty"`
-	Vec     []float32         `json:"vec,omitempty"` // for future embedding use
-	Tags    []string          `json:"tags,omitempty"`
-	Score   float64           `json:"score,omitempty"`
-	Extra   map[string]string `json:"extra,omitempty"`
-}
-
-type ring struct {
-	data []Message
-	next int
-	size int
-}
-
-func newRing(capacity int) *ring {
-	return &ring{data: make([]Message, 0, capacity), next: 0, size: capacity}
-}
-
-func (r *ring) append(m Message) {
-	if len(r.data) < r.size {
-		r.data = append(r.data, m)
-		return
-	}
-	r.data[r.next] = m
-	r.next = (r.next + 1) % r.size
-}
-
-func (r *ring) sliceNewest(limit int) []Message {
-	n := len(r.data)
-	if limit <= 0 || limit > n {
-		limit = n
-	}
-	out := make([]Message, 0, limit)
-	for i := 0; i < limit; i++ {
-		idx := (r.next - 1 - i + n) % n
-		out = append(out, r.data[idx])
-	}
-	return out
-}
-
-type bucketKey struct {
-	Session string
-	Space   string
-}
-
-type InProcessMemory struct {
+// App wires MemoryBank + SessionMemory + Spaces and registers MCP tools.
+type App struct {
+	bank   *memory.MemoryBank
+	sm     *memory.SessionMemory
+	engine *memory.Engine
+	spaces *memory.SpaceRegistry
+	// Shared session views per principal (e.g., "user:kamil").
+	shared map[string]*memory.SharedSession
 	mu     sync.RWMutex
-	store  map[bucketKey]*ring
-	limit  int
-	engine *mem.Engine // optional: wired, not required to run
 }
 
-func NewInProcessMemory(limit int, engine *mem.Engine) *InProcessMemory {
-	return &InProcessMemory{
-		store:  make(map[bucketKey]*ring),
-		limit:  limit,
-		engine: engine,
-	}
-}
+func newApp(ctx context.Context) (*App, error) {
+	storeKind := strings.ToLower(env("MEMORY_STORE", "inmemory"))
+	shortBuf := atoi(env("SHORT_TERM_SIZE", "20"), 20)
+	spaceTTL := atoi(env("DEFAULT_SPACE_TTL_SEC", "86400"), 86400) // 24h
 
-func (m *InProcessMemory) Append(ctx context.Context, session, space, role, content string, meta map[string]any) (Message, error) {
-	if strings.TrimSpace(session) == "" || strings.TrimSpace(space) == "" {
-		return Message{}, errors.New("session and space are required")
-	}
-	msg := Message{
-		Ts:      time.Now().UTC(),
-		Role:    role,
-		Content: content,
-		Meta:    meta,
-	}
-	// (Optional) If you want to embed now via go-agent engine:
-	// if m.engine != nil {
-	//     vec, err := m.engine.Embed(ctx, content)
-	//     if err == nil {
-	//         msg.Vec = vec
-	//     }
-	// }
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := bucketKey{Session: session, Space: space}
-	r, ok := m.store[key]
-	if !ok {
-		r = newRing(m.limit)
-		m.store[key] = r
-	}
-	r.append(msg)
-	return msg, nil
-}
-
-func (m *InProcessMemory) Recent(_ context.Context, session, space string, limit int) ([]Message, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	key := bucketKey{Session: session, Space: space}
-	r, ok := m.store[key]
-	if !ok {
-		return nil, nil
-	}
-	return r.sliceNewest(limit), nil
-}
-
-func (m *InProcessMemory) Search(_ context.Context, session, space, query string, limit int) ([]Message, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	key := bucketKey{Session: session, Space: space}
-	r, ok := m.store[key]
-	if !ok {
-		return nil, nil
-	}
-	// naive substring search (replace with engine retrieval when ready)
-	matches := make([]Message, 0, limit)
-	for i := len(r.data) - 1; i >= 0 && len(matches) < limit; i-- {
-		if strings.Contains(strings.ToLower(r.data[i].Content), strings.ToLower(query)) {
-			matches = append(matches, r.data[i])
+	// Select backing store
+	var vs memory.VectorStore
+	var err error
+	switch storeKind {
+	case "postgres", "pg":
+		dsn := mustEnv("POSTGRES_DSN")
+		vs, err = memory.NewPostgresStore(ctx, dsn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create postgres store: %w", err)
 		}
+	case "qdrant":
+		base := mustEnv("QDRANT_URL")
+		col := env("QDRANT_COLLECTION", "memories")
+		api := env("QDRANT_API_KEY", "")
+		vs = memory.NewQdrantStore(base, col, api)
+	default:
+		vs = memory.NewInMemoryStore()
 	}
-	return matches, nil
-}
 
-// -----------------------------------------------------------------------------
-// Wire go-agent memory engine (optional but ready)
-// -----------------------------------------------------------------------------
+	bank := memory.NewMemoryBankWithStore(vs)
+	eng := memory.NewEngine(vs, memory.DefaultOptions()).WithEmbedder(memory.AutoEmbedder())
+	sm := memory.NewSessionMemory(bank, shortBuf).WithEmbedder(memory.AutoEmbedder()).WithEngine(eng)
+	spaces := memory.NewSpaceRegistry(time.Duration(spaceTTL) * time.Second)
 
-type EngineBundle struct {
-	Store   mem.VectorStore
-	Bank    *mem.MemoryBank
-	Engine  *mem.Engine
-	Session *mem.SessionMemory
-}
-
-func buildEngineBundle(ctx context.Context) (*EngineBundle, error) {
-	// Default: in-memory vector store
-	store := mem.NewInMemoryStore()
-
-	// Engine options + embedder (replace AutoEmbedder with your provider if desired)
-	opts := mem.DefaultOptions()
-	engine := mem.NewEngine(store, opts).WithEmbedder(mem.AutoEmbedder())
-
-	// Session memory with a memory bank backing it
-	bank := mem.NewMemoryBankWithStore(store)
-	session := mem.NewSessionMemory(bank, 32).WithEngine(engine)
-
-	return &EngineBundle{
-		Store:   store,
-		Bank:    bank,
-		Engine:  engine,
-		Session: session,
+	return &App{
+		bank:   bank,
+		sm:     sm,
+		engine: eng,
+		spaces: spaces,
+		shared: make(map[string]*memory.SharedSession),
 	}, nil
 }
 
-// -----------------------------------------------------------------------------
-// MCP server setup and tool handlers
-// -----------------------------------------------------------------------------
+func (a *App) sharedFor(principal string) *memory.SharedSession {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ss := a.shared[principal]
+	if ss == nil {
+		ss = memory.NewSharedSession(a.sm, principal)
+		a.shared[principal] = ss
+	}
+	return ss
+}
+
+// Helper to get optional string parameter
+func getStringParam(req mcp.CallToolRequest, key string) string {
+	args, ok := req.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	val, ok := args[key]
+	if !ok {
+		return ""
+	}
+	str, _ := val.(string)
+	return str
+}
+
+// Helper to get optional number parameter
+func getNumberParam(req mcp.CallToolRequest, key string) float64 {
+	args, ok := req.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	val, ok := args[key]
+	if !ok {
+		return 0
+	}
+	num, _ := val.(float64)
+	return num
+}
 
 func main() {
+	var (
+		transport = flag.String("transport", "stdio", "stdio|http")
+		addr      = flag.String("addr", ":8080", "addr for http")
+	)
+	flag.Parse()
+
 	ctx := context.Background()
-
-	// Build go-agent memory engine (safe to keep even if unused at first)
-	var engineBundle *EngineBundle
-	{
-		eb, err := buildEngineBundle(ctx)
-		if err != nil {
-			log.Printf("⚠️ memory engine init failed (continuing with minimal store): %v", err)
-		}
-		engineBundle = eb
+	app, err := newApp(ctx)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	// Minimal in-process memory (ring buffer per session+space)
-	inproc := NewInProcessMemory(512, nil)
-	if engineBundle != nil {
-		inproc.engine = engineBundle.Engine
-	}
-
-	srv := server.NewMCPServer("memory-bank-mcp", "0.1.0", nil)
-
-	// Tool: memory.store
-	// Stores a message in (session, space) with role + content + optional metadata.
-	storeTool := mcp.NewTool(
-		"memory.store",
-		mcp.WithDescription("Store a memory message into a session/space."),
-		mcp.WithString("session", mcp.Required(), mcp.Description("Session identifier")),
-		mcp.WithString("space", mcp.Required(), mcp.Description("Space/channel name (e.g., 'default', 'team:core')")),
-		mcp.WithString("role", mcp.Description("Role of the author: user|agent|system"), mcp.DefaultString("user")),
-		mcp.WithString("content", mcp.Required(), mcp.Description("Text content to store")),
-		mcp.WithObject("meta", mcp.Description("Optional metadata object")),
+	s := server.NewMCPServer(
+		"memory-bank-mcp",
+		"0.1.0",
+		server.WithToolCapabilities(true),
+		server.WithRecovery(),
 	)
 
-	srv.AddTool(storeTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		session, err := req.RequireString("session")
+	// ---- Tool: health.ping ----
+	ping := mcp.NewTool("health.ping", mcp.WithDescription("Return pong and server time"))
+	s.AddTool(ping, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		res, _ := mcp.NewToolResultJSON(map[string]any{"pong": true, "time": time.Now().Format(time.RFC3339)})
+		return res, nil
+	})
+
+	// ---- Tool: memory.embed(text) -> []float32 ----
+	embedTool := mcp.NewTool("memory.embed",
+		mcp.WithDescription("Return embedding vector for a text using AutoEmbedder (ADK_EMBED_* env)"),
+		mcp.WithString("text", mcp.Required(), mcp.Description("Text to embed")),
+	)
+	s.AddTool(embedTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		text, err := req.RequireString("text")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing required parameter 'text': %v", err)), nil
 		}
-		space, err := req.RequireString("space")
+		e, err := app.sm.Embed(ctx, text)
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(err.Error()), nil
 		}
-		role, err := req.RequireString("role")
-		if err != nil || role == "" {
-			role = "user"
+		res, _ := mcp.NewToolResultJSON(e)
+		return res, nil
+	})
+
+	// ---- Tool: memory.add_short(session_id, content, metadata_json) ----
+	addShort := mcp.NewTool("memory.add_short",
+		mcp.WithDescription("Append short-term memory to a session buffer (flush later to long-term)"),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("content", mcp.Required()),
+		mcp.WithString("metadata_json", mcp.Description("JSON object (string->string)")),
+	)
+	s.AddTool(addShort, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, err := req.RequireString("session_id")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing session_id: %v", err)), nil
 		}
 		content, err := req.RequireString("content")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing content: %v", err)), nil
 		}
 
-		var meta map[string]any
-		// meta is optional
-		if raw := req.Params.Arguments.(map[string]string)["meta"]; raw != "" {
-			// Make sure it's JSON-objecty
-			b, _ := json.Marshal(raw)
-			_ = json.Unmarshal(b, &meta)
-			if meta == nil {
-				meta = map[string]any{}
+		metaStr := getStringParam(req, "metadata_json")
+		m := map[string]string{}
+		if metaStr != "" {
+			if err := json.Unmarshal([]byte(metaStr), &m); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid metadata_json: %v", err)), nil
+			}
+		}
+		e, err := app.sm.Embed(ctx, content)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		app.sm.AddShortTerm(sid, content, stringMapToJSON(m), e)
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	// ---- Tool: memory.flush(session_id) ----
+	flush := mcp.NewTool("memory.flush",
+		mcp.WithDescription("Promote short-term buffer to long-term vector store for the given session"),
+		mcp.WithString("session_id", mcp.Required()),
+	)
+	s.AddTool(flush, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, err := req.RequireString("session_id")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing session_id: %v", err)), nil
+		}
+		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText("flushed"), nil
+	})
+
+	// ---- Tool: memory.store_long(session_id, content, metadata_json) -> MemoryRecord ----
+	storeLong := mcp.NewTool("memory.store_long",
+		mcp.WithDescription("Embed, score and persist a long-term memory (uses Engine)"),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("content", mcp.Required()),
+		mcp.WithString("metadata_json", mcp.Description("JSON object (any) e.g. {\"source\":\"chat\"}")),
+	)
+	s.AddTool(storeLong, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, err := req.RequireString("session_id")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing session_id: %v", err)), nil
+		}
+		content, err := req.RequireString("content")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing content: %v", err)), nil
+		}
+
+		meta := map[string]any{}
+		metaStr := getStringParam(req, "metadata_json")
+		if metaStr != "" {
+			if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid metadata_json: %v", err)), nil
 			}
 		}
 
-		msg, err := inproc.Append(ctx, session, space, role, content, meta)
+		rec, err := app.engine.Store(ctx, sid, content, meta)
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(err.Error()), nil
 		}
-
-		// Return a small payload
-		out := map[string]any{
-			"stored":  true,
-			"session": session,
-			"space":   space,
-			"role":    role,
-			"ts":      msg.Ts,
-		}
-		res, err := mcp.NewToolResultJSON(out)
-		if err != nil {
-			return nil, err
-		}
+		res, _ := mcp.NewToolResultJSON(rec)
 		return res, nil
 	})
 
-	// Tool: memory.recent
-	// Returns last N messages for (session, space).
-	recentTool := mcp.NewTool(
-		"memory.recent",
-		mcp.WithDescription("Get most recent messages from a session/space."),
-		mcp.WithString("session", mcp.Required(), mcp.Description("Session identifier")),
-		mcp.WithString("space", mcp.Required(), mcp.Description("Space/channel name")),
-		mcp.WithNumber("limit", mcp.Description("Max messages to return"), mcp.DefaultNumber(20)),
+	// ---- Tool: memory.retrieve_context(session_id, query, limit) -> []MemoryRecord ----
+	retrieve := mcp.NewTool("memory.retrieve_context",
+		mcp.WithDescription("Return top-k memories (short+long term) for session"),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("query", mcp.Required()),
+		mcp.WithNumber("limit"),
 	)
-
-	srv.AddTool(recentTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		session, err := req.RequireString("session")
+	s.AddTool(retrieve, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, err := req.RequireString("session_id")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing session_id: %v", err)), nil
+		}
+		q, err := req.RequireString("query")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing query: %v", err)), nil
+		}
+
+		limit := int(getNumberParam(req, "limit"))
+		if limit <= 0 {
+			limit = 8
+		}
+
+		recs, err := app.sm.RetrieveContext(ctx, sid, q, limit)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		res, _ := mcp.NewToolResultJSON(recs)
+		return res, nil
+	})
+
+	// ---- Tools: spaces.* (ACL + TTL registry) ----
+	spacesUpsert := mcp.NewTool("spaces.upsert",
+		mcp.WithDescription("Create or update a space definition with TTL and ACL"),
+		mcp.WithString("name", mcp.Required()),
+		mcp.WithNumber("ttl_seconds"),
+		mcp.WithString("acl_json", mcp.Description("JSON map principal->role (reader|writer|admin)")),
+	)
+	s.AddTool(spacesUpsert, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		name, err := req.RequireString("name")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing name: %v", err)), nil
+		}
+
+		ttl := getNumberParam(req, "ttl_seconds")
+
+		acl := map[string]string{}
+		aclStr := getStringParam(req, "acl_json")
+		if aclStr != "" {
+			if err := json.Unmarshal([]byte(aclStr), &acl); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid acl_json: %v", err)), nil
+			}
+		}
+
+		m := map[string]memory.SpaceRole{}
+		for p, role := range acl {
+			m[p] = parseRole(role)
+		}
+		app.spaces.Upsert(name, time.Duration(int(ttl))*time.Second, m)
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	spacesGrant := mcp.NewTool("spaces.grant",
+		mcp.WithDescription("Grant a role to a principal for a space"),
+		mcp.WithString("name", mcp.Required()),
+		mcp.WithString("principal", mcp.Required()),
+		mcp.WithString("role", mcp.Required()),
+		mcp.WithNumber("ttl_seconds"),
+	)
+	s.AddTool(spacesGrant, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		name, err := req.RequireString("name")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing name: %v", err)), nil
+		}
+		principal, err := req.RequireString("principal")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
+		}
+		roleStr, err := req.RequireString("role")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing role: %v", err)), nil
+		}
+
+		ttl := int(getNumberParam(req, "ttl_seconds"))
+		if ttl <= 0 {
+			ttl = 3600
+		}
+
+		if err := app.spaces.Grant(name, principal, parseRole(roleStr), time.Duration(ttl)*time.Second); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	spacesRevoke := mcp.NewTool("spaces.revoke",
+		mcp.WithDescription("Revoke a principal from a space"),
+		mcp.WithString("name", mcp.Required()),
+		mcp.WithString("principal", mcp.Required()),
+	)
+	s.AddTool(spacesRevoke, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		name, err := req.RequireString("name")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing name: %v", err)), nil
+		}
+		principal, err := req.RequireString("principal")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
+		}
+		app.spaces.Revoke(name, principal)
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	spacesList := mcp.NewTool("spaces.list",
+		mcp.WithDescription("List spaces visible to a principal"),
+		mcp.WithString("principal", mcp.Required()),
+	)
+	s.AddTool(spacesList, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		principal, err := req.RequireString("principal")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
+		}
+		list := app.spaces.List(principal)
+		res, _ := mcp.NewToolResultJSON(list)
+		return res, nil
+	})
+
+	// ---- Shared session convenience tools ----
+	sharedJoin := mcp.NewTool("shared.join",
+		mcp.WithDescription("Ensure a principal view exists and join a space"),
+		mcp.WithString("principal", mcp.Required()),
+		mcp.WithString("space", mcp.Required()),
+	)
+	s.AddTool(sharedJoin, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		p, err := req.RequireString("principal")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
 		}
 		space, err := req.RequireString("space")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing space: %v", err)), nil
 		}
-		limit, err := req.RequireInt("limit")
-		if err != nil || limit <= 0 {
-			limit = 20
+		ss := app.sharedFor(p)
+		if err := ss.Join(space); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
-
-		items, err := inproc.Recent(ctx, session, space, limit)
-		if err != nil {
-			return nil, err
-		}
-
-		res, err := mcp.NewToolResultJSON(map[string]any{
-			"session":  session,
-			"space":    space,
-			"messages": items,
-			"count":    len(items),
-		})
-		if err != nil {
-			return nil, err
-		}
-		return res, nil
+		return mcp.NewToolResultText("ok"), nil
 	})
 
-	// Tool: memory.search
-	// Naive substring search over stored content. Replace with go-agent retrieval later.
-	searchTool := mcp.NewTool(
-		"memory.search",
-		mcp.WithDescription("Search messages in a session/space by substring (upgradeable to vector search)."),
-		mcp.WithString("session", mcp.Required(), mcp.Description("Session identifier")),
-		mcp.WithString("space", mcp.Required(), mcp.Description("Space/channel name")),
-		mcp.WithString("query", mcp.Required(), mcp.Description("Query string to match")),
-		mcp.WithNumber("limit", mcp.Description("Max results"), mcp.DefaultNumber(10)),
+	sharedLeave := mcp.NewTool("shared.leave",
+		mcp.WithDescription("Leave a space in principal view"),
+		mcp.WithString("principal", mcp.Required()),
+		mcp.WithString("space", mcp.Required()),
 	)
-
-	srv.AddTool(searchTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		session, err := req.RequireString("session")
+	s.AddTool(sharedLeave, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		p, err := req.RequireString("principal")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
 		}
 		space, err := req.RequireString("space")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing space: %v", err)), nil
 		}
-		query, err := req.RequireString("query")
-		if err != nil {
-			return nil, err
-		}
-		limit, err := req.RequireInt("limit")
-		if err != nil || limit <= 0 {
-			limit = 10
-		}
-
-		items, err := inproc.Search(ctx, session, space, query, limit)
-		if err != nil {
-			return nil, err
-		}
-
-		res, err := mcp.NewToolResultJSON(map[string]any{
-			"session": session,
-			"space":   space,
-			"query":   query,
-			"results": items,
-			"count":   len(items),
-		})
-		if err != nil {
-			return nil, err
-		}
-		return res, nil
+		app.sharedFor(p).Leave(space)
+		return mcp.NewToolResultText("ok"), nil
 	})
 
-	// Tool: memory.health
-	healthTool := mcp.NewTool(
-		"memory.health",
-		mcp.WithDescription("Health check / info about the memory MCP server."),
+	sharedAdd := mcp.NewTool("shared.add_short_to",
+		mcp.WithDescription("Add short-term memory directly to a shared space buffer"),
+		mcp.WithString("principal", mcp.Required()),
+		mcp.WithString("space", mcp.Required()),
+		mcp.WithString("content", mcp.Required()),
+		mcp.WithString("metadata_json"),
 	)
-
-	srv.AddTool(healthTool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		engineReady := engineBundle != nil && engineBundle.Engine != nil
-		payload := map[string]any{
-			"name":          "memory-bank-mcp",
-			"version":       "0.1.0",
-			"engine_wired":  engineReady,
-			"store_backend": "inproc-ring",
-			"time_utc":      time.Now().UTC().Format(time.RFC3339),
-		}
-		res, err := mcp.NewToolResultJSON(payload)
+	s.AddTool(sharedAdd, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		p, err := req.RequireString("principal")
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
 		}
+		space, err := req.RequireString("space")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing space: %v", err)), nil
+		}
+		content, err := req.RequireString("content")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing content: %v", err)), nil
+		}
+
+		meta := map[string]string{}
+		metaStr := getStringParam(req, "metadata_json")
+		if metaStr != "" {
+			if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid metadata_json: %v", err)), nil
+			}
+		}
+
+		if err := app.sharedFor(p).AddShortTo(space, content, meta); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	sharedRetrieve := mcp.NewTool("shared.retrieve",
+		mcp.WithDescription("Retrieve merged (local+spaces) or only shared if only_shared=true"),
+		mcp.WithString("principal", mcp.Required()),
+		mcp.WithString("query", mcp.Required()),
+		mcp.WithNumber("limit"),
+		mcp.WithString("only_shared"),
+	)
+	s.AddTool(sharedRetrieve, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		p, err := req.RequireString("principal")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing principal: %v", err)), nil
+		}
+		q, err := req.RequireString("query")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing query: %v", err)), nil
+		}
+
+		limit := int(getNumberParam(req, "limit"))
+		if limit <= 0 {
+			limit = 8
+		}
+
+		only := strings.ToLower(getStringParam(req, "only_shared")) == "true"
+
+		var (
+			recs []memory.MemoryRecord
+			rerr error
+		)
+		if only {
+			recs, rerr = app.sharedFor(p).RetrieveShared(ctx, q, limit)
+		} else {
+			recs, rerr = app.sharedFor(p).Retrieve(ctx, q, limit)
+		}
+		if rerr != nil {
+			return mcp.NewToolResultError(rerr.Error()), nil
+		}
+		res, _ := mcp.NewToolResultJSON(recs)
 		return res, nil
 	})
 
-	// Serve over stdio by default (MCP runtime convention)
-	if err := server.ServeStdio(srv /* no stdio opts */); err != nil {
-		// If you're testing locally outside of a client, you can run a quick “inline call”
-		// by setting MCP_TRANSPORT=none to prevent stdio loop.
-		if os.Getenv("MCP_TRANSPORT") == "none" {
-			fmt.Println("Server initialized (noop mode).")
-			return
+	metrics := mcp.NewTool("engine.metrics", mcp.WithDescription("Return engine metrics snapshot"))
+	s.AddTool(metrics, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		res, _ := mcp.NewToolResultJSON(app.engine.MetricsSnapshot())
+		return res, nil
+	})
+
+	// ---- start transport ----
+	switch strings.ToLower(*transport) {
+	case "stdio":
+		if err := server.ServeStdio(s); err != nil {
+			log.Fatal(err)
 		}
-		log.Fatalf("stdio server error: %v", err)
+	case "http":
+		h := server.NewStreamableHTTPServer(s)
+		log.Printf("HTTP listening on %s", *addr)
+		if err := h.Start(*addr); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		log.Fatal("unknown transport: ", *transport)
 	}
+}
+
+// --- helpers ---
+func env(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+func mustEnv(k string) string {
+	v := os.Getenv(k)
+	if v == "" {
+		panic(fmt.Errorf("missing env %s", k))
+	}
+	return v
+}
+func atoi(s string, def int) int {
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
+func parseRole(s string) memory.SpaceRole {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "admin":
+		return memory.SpaceRoleAdmin
+	case "writer", "write":
+		return memory.SpaceRoleWriter
+	default:
+		return memory.SpaceRoleReader
+	}
+}
+
+func stringMapToJSON(m map[string]string) string {
+	b, _ := json.Marshal(m)
+	return string(b)
 }
