@@ -14,6 +14,7 @@ import (
 	"time"
 
 	memory "github.com/Protocol-Lattice/go-agent/src/memory"
+
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -49,6 +50,15 @@ func newApp(ctx context.Context) (*App, error) {
 		col := env("QDRANT_COLLECTION", "memories")
 		api := env("QDRANT_API_KEY", "")
 		vs = memory.NewQdrantStore(base, col, api)
+	case "mongo":
+		uri := mustEnv("MONGO_URI")
+		database := mustEnv("MONGO_DATABASE")
+		collection := env("MONGO_COLLECTION", "memories")
+		vs, err = memory.NewMongoStore(ctx, uri, database, collection)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mongo store: %w", err)
+		}
+
 	default:
 		vs = memory.NewInMemoryStore()
 	}
