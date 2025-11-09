@@ -7,7 +7,7 @@ Minimal, production-ready **Model Context Protocol (MCP)** server that provides 
 
 ## Why this exists
 
-- **Drop-in MCP server**: clean stdio server via `mark3labs/mcp-go`. :contentReference[oaicite:5]{index=5}  
+- **Drop-in MCP server**: clean stdio server via `mark3labs/mcp-go`.
 - **Works instantly**: uses an internal ring buffer per `(session, space)` so you can store/retrieve right away. :contentReference[oaicite:6]{index=6} :contentReference[oaicite:7]{index=7}  
 - **Upgradable**: comes pre-wired to Protocol-Lattice’s memory engine (in-memory vector store + embedder) — you can flip to vector search/session memory later. :contentReference[oaicite:8]{index=8} :contentReference[oaicite:9]{index=9}
 
