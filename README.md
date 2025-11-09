@@ -3,8 +3,6 @@
 Minimal, production-ready **Model Context Protocol (MCP)** server that provides a lightweight memory “bank” with a simple, concurrency-safe in-process store — and an easy upgrade path to Protocol-Lattice’s vector memory engine.
 
 - Server name/version: `memory-bank-mcp` / `0.1.0`. :contentReference[oaicite:0]{index=0}  
-- Ships four tools: `memory.store`, `memory.recent`, `memory.search`, `memory.health`. :contentReference[oaicite:1]{index=1} :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
-
 ---
 
 ## Why this exists
