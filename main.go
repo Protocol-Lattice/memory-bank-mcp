@@ -279,10 +279,10 @@ func main() {
 	})
 	chainPrompt := mcp.NewTool("memory.chain_prompt",
 		mcp.WithDescription("Embed, store, flush, retrieve, and return a prompt with context memories"),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("content", mcp.Required()),
-		mcp.WithString("query", mcp.Required()),
-		mcp.WithNumber("limit"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("Memory session identifier")),
+		mcp.WithString("content", mcp.Required(), mcp.Description("New content to store and embed")),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Semantic query for retrieval")),
+		mcp.WithNumber("limit", mcp.Description("Number of memories to retrieve")),
 	)
 	s.AddTool(chainPrompt, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sid, err := req.RequireString("session_id")
@@ -309,34 +309,34 @@ func main() {
 		}
 
 		// Step 2: Add short-term memory
+		// (AddShortTerm returns nothing)
 		app.sm.AddShortTerm(sid, content, "{}", e)
 
-		// Step 3: Flush short-term to long-term
+		// Step 3: Flush to long-term memory
 		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("flush failed: %v", err)), nil
 		}
 
-		// Step 4: Retrieve related memories
+		// Step 4: Retrieve top related memories
 		recs, err := app.sm.RetrieveContext(ctx, sid, query, limit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("retrieve failed: %v", err)), nil
 		}
 
-		// Step 5: Build a context prompt
+		// Step 5: Build LLM-ready prompt
 		var ctxLines []string
 		for i, r := range recs {
 			ctxLines = append(ctxLines, fmt.Sprintf("%d. %s", i+1, r.Content))
 		}
-		promptText := fmt.Sprintf("[Context Memories]\n%s\n\n[User Input]\n%s",
+		prompt := fmt.Sprintf("[Context Memories]\n%s\n\n[User Input]\n%s",
 			strings.Join(ctxLines, "\n"), content)
 
-		// Step 6: Return both structured data and ready-to-use text
+		// Step 6: Return structured output
 		out := map[string]any{
 			"embedding": e,
 			"records":   recs,
-			"prompt":    promptText,
+			"prompt":    prompt,
 		}
-
 		res, _ := mcp.NewToolResultJSON(out)
 		return res, nil
 	})
