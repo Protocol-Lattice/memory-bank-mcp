@@ -3,7 +3,7 @@ module github.com/Protocol-Lattice/memory-bank-mcp
 go 1.25.0
 
 require (
-	github.com/Protocol-Lattice/go-agent v0.6.7
+	github.com/Protocol-Lattice/go-agent v0.6.8
 	github.com/mark3labs/mcp-go v0.43.0
 )
 

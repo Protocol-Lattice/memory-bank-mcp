@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -310,8 +311,9 @@ func main() {
 
 		// Step 2: Add short-term memory
 		// (AddShortTerm returns nothing)
-		app.sm.AddShortTerm(sid, content, "{}", e)
-
+		synthesized := fmt.Sprintf("%s\n\n[Generated Response]\n%s", query, content)
+		app.sm.AddShortTerm(sid, synthesized, "{}", e)
+		app.sm.FlushToLongTerm(ctx, sid)
 		// Step 3: Flush to long-term memory
 		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("flush failed: %v", err)), nil
@@ -339,6 +341,59 @@ func main() {
 		}
 		res, _ := mcp.NewToolResultJSON(out)
 		return res, nil
+	})
+
+	storeCodebase := mcp.NewTool("memory.store_codebase",
+		mcp.WithDescription("Recursively read all files from a directory and store them as long-term memory records"),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("path", mcp.Required()),
+		mcp.WithString("extensions", mcp.Description("Comma-separated file extensions to include (e.g. .go,.md,.json)")),
+	)
+	s.AddTool(storeCodebase, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, err := req.RequireString("session_id")
+		if err != nil {
+			return mcp.NewToolResultError("missing session_id"), nil
+		}
+		root, err := req.RequireString("path")
+		if err != nil {
+			return mcp.NewToolResultError("missing path"), nil
+		}
+
+		extFilter := strings.Split(getStringParam(req, "extensions"), ",")
+		allowed := map[string]bool{}
+		for _, e := range extFilter {
+			allowed[strings.TrimSpace(e)] = true
+		}
+
+		err = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			ext := filepath.Ext(p)
+			if len(allowed) > 0 && !allowed[ext] {
+				return nil
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			// Optional: Chunk large files (e.g. >5KB)
+			chunks := memory.ChunkText(string(data), 3000)
+			for _, c := range chunks {
+				if _, err := app.engine.Store(ctx, sid, c, map[string]any{
+					"source": "file",
+					"path":   p,
+					"size":   len(data),
+				}); err != nil {
+					log.Printf("[WARN] failed to store chunk from %s: %v", p, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText("codebase stored"), nil
 	})
 
 	// ---- Tools: spaces.* (ACL + TTL registry) ----
