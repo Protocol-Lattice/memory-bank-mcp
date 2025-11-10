@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,8 +32,8 @@ type App struct {
 }
 
 func newApp(ctx context.Context) (*App, error) {
-	storeKind := strings.ToLower(env("MEMORY_STORE", "inmemory"))
-	shortBuf := atoi(env("SHORT_TERM_SIZE", "20"), 20)
+	storeKind := strings.ToLower(env("MEMORY_STORE", "qdrant"))
+	shortBuf := atoi(env("SHORT_TERM_SIZE", "500000"), 500000)
 	spaceTTL := atoi(env("DEFAULT_SPACE_TTL_SEC", "86400"), 86400) // 24h
 
 	// Select backing store
@@ -50,6 +51,7 @@ func newApp(ctx context.Context) (*App, error) {
 		col := env("QDRANT_COLLECTION", "memories")
 		api := env("QDRANT_API_KEY", "")
 		vs = memory.NewQdrantStore(base, col, api)
+
 	case "mongo":
 		uri := mustEnv("MONGO_URI")
 		database := mustEnv("MONGO_DATABASE")
@@ -130,7 +132,7 @@ func main() {
 	}
 
 	s := server.NewMCPServer(
-		"memory-bank-mcp",
+		"memory",
 		"0.1.0",
 		server.WithToolCapabilities(true),
 		server.WithRecovery(),
@@ -144,7 +146,7 @@ func main() {
 	})
 
 	// ---- Tool: memory.embed(text) -> []float32 ----
-	embedTool := mcp.NewTool("memory.embed",
+	embedTool := mcp.NewTool("embed",
 		mcp.WithDescription("Return embedding vector for a text using AutoEmbedder (ADK_EMBED_* env)"),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Text to embed")),
 	)
@@ -162,6 +164,99 @@ func main() {
 		})
 		return res, nil
 
+	})
+
+	// Tool: memory.store_codebase
+	// Reads all files under a directory and stores them as long-term memory records.
+	storeCodebase := mcp.NewTool("store_codebase",
+		mcp.WithDescription("Recursively store codebase files into memory context"),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("path", mcp.Required()),
+		mcp.WithString("extensions", mcp.Description("Comma-separated extensions, e.g. .go,.md,.json")),
+	)
+	s.AddTool(storeCodebase, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, _ := req.RequireString("session_id")
+		root, _ := req.RequireString("path")
+
+		// Get extensions parameter
+		extsParam := getStringParam(req, "extensions")
+		log.Printf("DEBUG: extensions param = '%s'\n", extsParam)
+
+		// Build allowed extensions map
+		allowed := map[string]bool{}
+		if extsParam != "" {
+			exts := strings.Split(extsParam, ",")
+			for _, e := range exts {
+				e = strings.TrimSpace(e)
+				if e == "" {
+					continue
+				}
+				if !strings.HasPrefix(e, ".") {
+					e = "." + e // normalize extension
+				}
+				allowed[e] = true
+			}
+		}
+
+		log.Printf("✅ Allowed extensions: %v (empty = all files)\n", allowed)
+
+		count := 0
+		skipped := 0
+
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+
+			ext := filepath.Ext(path)
+
+			// If allowed map has entries, check if this extension is allowed
+			if len(allowed) > 0 && !allowed[ext] {
+				skipped++
+				return nil
+			}
+
+			fmt.Printf("📄 Processing file: %s (ext: %s)\n", path, ext)
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				log.Printf("❌ read failed: %v", err)
+				return nil
+			}
+
+			meta := map[string]any{
+				"path": path,
+				"type": "code",
+				"ext":  ext,
+				"size": len(data),
+			}
+
+			_, err = app.engine.Store(ctx, sid, string(data), meta)
+			if err != nil {
+				log.Printf("❌ store failed for %s: %v", path, err)
+			} else {
+				count++
+				fmt.Printf("✅ Stored: %s\n", path)
+			}
+			return nil
+		})
+
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("walk error: %v", err)), nil
+		}
+
+		log.Printf("📊 Summary: %d files stored, %d files skipped\n", count, skipped)
+
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"stored_files":  count,
+			"skipped_files": skipped,
+			"path":          root,
+			"extensions":    extsParam,
+		})
+		return res, nil
 	})
 
 	// ---- Tool: memory.add_short(session_id, content, metadata_json) ----
@@ -245,38 +340,35 @@ func main() {
 		return res, nil
 	})
 
-	// ---- Tool: memory.retrieve_context(session_id, query, limit) -> []MemoryRecord ----
-	retrieve := mcp.NewTool("memory.retrieve_context",
-		mcp.WithDescription("Return top-k memories (short+long term) for session"),
+	// Tool: retrieve_context
+	retrieveCtx := mcp.NewTool(
+		"retrieve_context",
+		mcp.WithDescription("Retrieve relevant memory records based on a semantic query."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
-		mcp.WithNumber("limit"),
+		mcp.WithNumber("limit", mcp.Description("Number of records to return (default 3)")),
+		mcp.WithBoolean("all", mcp.Description("If true, returns all stored items regardless of similarity")),
 	)
-	s.AddTool(retrieve, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sid, err := req.RequireString("session_id")
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("missing session_id: %v", err)), nil
-		}
-		q, err := req.RequireString("query")
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("missing query: %v", err)), nil
-		}
+	s.AddTool(retrieveCtx, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sessionID, _ := req.RequireString("session_id")
+		query, _ := req.RequireString("query")
+		limit := int(req.GetInt("limit", 3))
+		log.Printf("[memory-bank] retrieve_context: session=%s query=%s limit=%d\n", sessionID, query, limit)
 
-		limit := int(getNumberParam(req, "limit"))
-		if limit <= 0 {
-			limit = 8
-		}
+		recs, err := app.sm.RetrieveContext(ctx, sessionID, query, limit)
 
-		recs, err := app.sm.RetrieveContext(ctx, sid, q, limit)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		res, _ := mcp.NewToolResultJSON(map[string]any{
-			"records": recs,
-		})
-		return res, nil
 
+		return mcp.NewToolResultJSON(map[string]any{
+			"session_id": sessionID,
+			"query":      query,
+			"limit":      limit,
+			"results":    recs,
+		})
 	})
+
 	chainPrompt := mcp.NewTool("memory.chain_prompt",
 		mcp.WithDescription("Embed, store, flush, retrieve, and return a prompt with context memories"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("Memory session identifier")),
@@ -296,49 +388,33 @@ func main() {
 			limit = 5
 		}
 
+		// Step 1: Embed content
 		e, err := app.sm.Embed(ctx, content)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("embed failed: %v", err)), nil
 		}
 
+		// Step 2: Store in short-term memory
 		app.sm.AddShortTerm(sid, content, "{}", e)
+
+		// Step 3: Flush to long-term memory
 		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("flush failed: %v", err)), nil
 		}
 
-		recs, err := app.sm.RetrieveContext(ctx, sid, query, limit)
-		if err != nil {
+		// Step 4: Retrieve context (not returned, just to trigger semantic linkage)
+		if _, err := app.sm.RetrieveContext(ctx, sid, query, limit); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("retrieve failed: %v", err)), nil
 		}
 
-		includeContents := strings.ToLower(getStringParam(req, "include_contents")) == "true"
-
-		var ctxLines []string
-		if includeContents {
-			for i, r := range recs {
-				path := ""
-				var meta map[string]any
-				if err := json.Unmarshal([]byte(r.Metadata), &meta); err == nil {
-					if p, ok := meta["path"]; ok {
-						path = fmt.Sprintf("[%v]", p)
-					}
-				}
-				ctxLines = append(ctxLines, fmt.Sprintf("%d. %s\n%s", i+1, path, r.Content))
-			}
-		} else {
-			for i, r := range recs {
-				ctxLines = append(ctxLines, fmt.Sprintf("%d. %s", i+1, r.Content))
-			}
-		}
-
-		prompt := fmt.Sprintf("[Context Files]\n%s\n\n[User Input]\n%s",
-			strings.Join(ctxLines, "\n\n"), content)
-
+		// Step 5: Return simple status confirmation
 		out := map[string]any{
-			"embedding": e,
-			"records":   recs,
-			"prompt":    prompt,
+			"status":   "Completed",
+			"session":  sid,
+			"query":    query,
+			"embedded": len(e) > 0,
 		}
+
 		res, _ := mcp.NewToolResultJSON(out)
 		return res, nil
 	})
@@ -560,20 +636,29 @@ func main() {
 	})
 
 	// ---- start transport ----
+	// ---- start transport ----
 	switch strings.ToLower(*transport) {
 	case "stdio":
 		if err := server.ServeStdio(s); err != nil {
 			log.Fatal(err)
 		}
+		// Create a plain HTTP handler that uses the MCP server's HandleRequest method
 	case "http":
+		log.SetOutput(os.Stderr)
+		log.Printf("[MCP] Starting HTTP server on %s", *addr)
+
+		// Create streamable MCP HTTP server (official supported interface)
 		h := server.NewStreamableHTTPServer(s)
-		log.Printf("HTTP listening on %s", *addr)
+
+		// Start the HTTP listener
 		if err := h.Start(*addr); err != nil {
-			log.Fatal(err)
+			log.Fatalf("failed to start MCP HTTP server: %v", err)
 		}
+
 	default:
 		log.Fatal("unknown transport: ", *transport)
 	}
+
 }
 
 // --- helpers ---
