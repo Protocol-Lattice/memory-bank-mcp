@@ -14,11 +14,33 @@ import (
 	"sync"
 	"time"
 
-	memory "github.com/Protocol-Lattice/go-agent/src/memory"
+	agent "github.com/Protocol-Lattice/go-agent"
+	"github.com/Protocol-Lattice/go-agent/src/adk"
+	adkmodules "github.com/Protocol-Lattice/go-agent/src/adk/modules"
+	"github.com/Protocol-Lattice/go-agent/src/memory"
+	"github.com/Protocol-Lattice/go-agent/src/memory/engine"
+	"github.com/Protocol-Lattice/go-agent/src/models"
+	"github.com/Protocol-Lattice/go-agent/src/subagents"
+	"github.com/Protocol-Lattice/go-agent/src/tools"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// GeminiSettings represents the configuration from .gemini/settings.json
+type GeminiSettings struct {
+	LLMModel         string `json:"llm_model"`
+	MemoryStore      string `json:"memory_store"`
+	QdrantURL        string `json:"qdrant_url"`
+	QdrantCollection string `json:"qdrant_collection"`
+	QdrantAPIKey     string `json:"qdrant_api_key"`
+	PostgresDSN      string `json:"postgres_dsn"`
+	MongoURI         string `json:"mongo_uri"`
+	MongoDatabase    string `json:"mongo_database"`
+	MongoCollection  string `json:"mongo_collection"`
+	ShortTermSize    int    `json:"short_term_size"`
+	DefaultSpaceTTL  int    `json:"default_space_ttl_sec"`
+}
 
 // App wires MemoryBank + SessionMemory + Spaces and registers MCP tools.
 type App struct {
@@ -26,42 +48,85 @@ type App struct {
 	sm     *memory.SessionMemory
 	engine *memory.Engine
 	spaces *memory.SpaceRegistry
-	// Shared session views per principal (e.g., "user:kamil").
 	shared map[string]*memory.SharedSession
 	mu     sync.RWMutex
 }
 
-func newApp(ctx context.Context) (*App, error) {
-	storeKind := strings.ToLower(env("MEMORY_STORE", "qdrant"))
-	shortBuf := atoi(env("SHORT_TERM_SIZE", "500000"), 500000)
-	spaceTTL := atoi(env("DEFAULT_SPACE_TTL_SEC", "86400"), 86400) // 24h
+// loadGeminiSettings reads configuration from .gemini/settings.json
+func loadGeminiSettings() (*GeminiSettings, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get home directory: %w", err)
+	}
 
-	// Select backing store
+	settingsPath := filepath.Join(home, ".gemini", "settings.json")
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Return default settings if file doesn't exist
+			log.Printf("No .gemini/settings.json found, using defaults")
+			return &GeminiSettings{
+				LLMModel:         "gemini-2.5-pro",
+				MemoryStore:      "qdrant",
+				QdrantURL:        "http://localhost:6334",
+				QdrantCollection: "memories",
+				ShortTermSize:    500000,
+				DefaultSpaceTTL:  86400,
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to read settings file: %w", err)
+	}
+
+	var settings GeminiSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, fmt.Errorf("failed to parse settings JSON: %w", err)
+	}
+
+	log.Printf("Loaded settings from %s", settingsPath)
+	return &settings, nil
+}
+
+func newApp(ctx context.Context, settings *GeminiSettings) (*App, error) {
+	// Use settings with environment variable fallbacks
+	storeKind := strings.ToLower(envOrDefault("MEMORY_STORE", settings.MemoryStore))
+	shortBuf := envIntOrDefault("SHORT_TERM_SIZE", settings.ShortTermSize)
+	spaceTTL := envIntOrDefault("DEFAULT_SPACE_TTL_SEC", settings.DefaultSpaceTTL)
+
 	var vs memory.VectorStore
 	var err error
+
 	switch storeKind {
 	case "postgres", "pg":
-		dsn := mustEnv("POSTGRES_DSN")
+		dsn := envOrDefault("POSTGRES_DSN", settings.PostgresDSN)
+		if dsn == "" {
+			return nil, fmt.Errorf("postgres_dsn not configured")
+		}
 		vs, err = memory.NewPostgresStore(ctx, dsn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create postgres store: %w", err)
 		}
+
 	case "qdrant":
-		base := mustEnv("QDRANT_URL")
-		col := env("QDRANT_COLLECTION", "memories")
-		api := env("QDRANT_API_KEY", "")
+		base := envOrDefault("QDRANT_URL", settings.QdrantURL)
+		col := envOrDefault("QDRANT_COLLECTION", settings.QdrantCollection)
+		api := envOrDefault("QDRANT_API_KEY", settings.QdrantAPIKey)
 		vs = memory.NewQdrantStore(base, col, api)
 
 	case "mongo":
-		uri := mustEnv("MONGO_URI")
-		database := mustEnv("MONGO_DATABASE")
-		collection := env("MONGO_COLLECTION", "memories")
+		uri := envOrDefault("MONGO_URI", settings.MongoURI)
+		database := envOrDefault("MONGO_DATABASE", settings.MongoDatabase)
+		collection := envOrDefault("MONGO_COLLECTION", settings.MongoCollection)
+		if uri == "" || database == "" {
+			return nil, fmt.Errorf("mongo_uri and mongo_database must be configured")
+		}
 		vs, err = memory.NewMongoStore(ctx, uri, database, collection)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create mongo store: %w", err)
 		}
 
 	default:
+		log.Printf("Using in-memory store (store kind: %s)", storeKind)
 		vs = memory.NewInMemoryStore()
 	}
 
@@ -90,7 +155,6 @@ func (a *App) sharedFor(principal string) *memory.SharedSession {
 	return ss
 }
 
-// Helper to get optional string parameter
 func getStringParam(req mcp.CallToolRequest, key string) string {
 	args, ok := req.Params.Arguments.(map[string]interface{})
 	if !ok {
@@ -104,7 +168,6 @@ func getStringParam(req mcp.CallToolRequest, key string) string {
 	return str
 }
 
-// Helper to get optional number parameter
 func getNumberParam(req mcp.CallToolRequest, key string) float64 {
 	args, ok := req.Params.Arguments.(map[string]interface{})
 	if !ok {
@@ -126,13 +189,59 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	app, err := newApp(ctx)
+
+	// Load settings from .gemini/settings.json
+	settings, err := loadGeminiSettings()
+	if err != nil {
+		log.Fatalf("Failed to load settings: %v", err)
+	}
+
+	app, err := newApp(ctx, settings)
 	if err != nil {
 		log.Fatal(err)
 	}
+	memOpts := engine.DefaultOptions()
+
+	// Use settings with environment variable overrides
+	llmModel := envOrDefault("LLM_MODEL", settings.LLMModel)
+	qdrantURL := envOrDefault("QDRANT_URL", settings.QdrantURL)
+	qdrantCollection := envOrDefault("QDRANT_COLLECTION", settings.QdrantCollection)
+
+	log.Printf("Configuration: LLM=%s, Store=%s, Qdrant=%s/%s",
+		llmModel, settings.MemoryStore, qdrantURL, qdrantCollection)
+
+	researcherModel, err := models.NewGeminiLLM(ctx, llmModel, "Research summary:")
+	if err != nil {
+		log.Fatalf("failed to create researcher model: %v", err)
+	}
+
+	kit, err := adk.New(
+		ctx,
+		adk.WithDefaultSystemPrompt("You orchestrate a helpful assistant team."),
+		adk.WithSubAgents(subagents.NewResearcher(researcherModel)),
+		adk.WithModules(
+			adkmodules.NewModelModule("gemini-model", func(_ context.Context) (models.Agent, error) {
+				return models.NewGeminiLLM(ctx, llmModel, "Swarm orchestration:")
+			}),
+			adkmodules.InQdrantMemory(
+				100000,
+				qdrantURL,
+				qdrantCollection,
+				memory.AutoEmbedder(),
+				&memOpts,
+			),
+			adkmodules.NewToolModule(
+				"essentials",
+				adkmodules.StaticToolProvider([]agent.Tool{&tools.EchoTool{}}, nil),
+			),
+		),
+	)
+	if err != nil {
+		log.Fatalf("failed to initialise kit: %v", err)
+	}
 
 	s := server.NewMCPServer(
-		"memory",
+		"memor-bank",
 		"0.1.0",
 		server.WithToolCapabilities(true),
 		server.WithRecovery(),
@@ -163,11 +272,9 @@ func main() {
 			"embedding": e,
 		})
 		return res, nil
-
 	})
 
 	// Tool: memory.store_codebase
-	// Reads all files under a directory and stores them as long-term memory records.
 	storeCodebase := mcp.NewTool("store_codebase",
 		mcp.WithDescription("Recursively store codebase files into memory context"),
 		mcp.WithString("session_id", mcp.Required()),
@@ -178,11 +285,9 @@ func main() {
 		sid, _ := req.RequireString("session_id")
 		root, _ := req.RequireString("path")
 
-		// Get extensions parameter
 		extsParam := getStringParam(req, "extensions")
 		log.Printf("DEBUG: extensions param = '%s'\n", extsParam)
 
-		// Build allowed extensions map
 		allowed := map[string]bool{}
 		if extsParam != "" {
 			exts := strings.Split(extsParam, ",")
@@ -192,7 +297,7 @@ func main() {
 					continue
 				}
 				if !strings.HasPrefix(e, ".") {
-					e = "." + e // normalize extension
+					e = "." + e
 				}
 				allowed[e] = true
 			}
@@ -213,7 +318,6 @@ func main() {
 
 			ext := filepath.Ext(path)
 
-			// If allowed map has entries, check if this extension is allowed
 			if len(allowed) > 0 && !allowed[ext] {
 				skipped++
 				return nil
@@ -259,7 +363,15 @@ func main() {
 		return res, nil
 	})
 
-	// ---- Tool: memory.add_short(session_id, content, metadata_json) ----
+	initTool := mcp.NewTool("initialize",
+		mcp.WithDescription("Generate a new session ID"))
+	s.AddTool(initTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid := fmt.Sprintf("sess-%d", time.Now().UnixNano())
+		res, _ := mcp.NewToolResultJSON(map[string]string{"session_id": sid})
+		return res, nil
+	})
+
+	// ---- Tool: memory.add_short ----
 	addShort := mcp.NewTool("memory.add_short",
 		mcp.WithDescription("Append short-term memory to a session buffer (flush later to long-term)"),
 		mcp.WithString("session_id", mcp.Required()),
@@ -291,7 +403,7 @@ func main() {
 		return mcp.NewToolResultText("ok"), nil
 	})
 
-	// ---- Tool: memory.flush(session_id) ----
+	// ---- Tool: memory.flush ----
 	flush := mcp.NewTool("memory.flush",
 		mcp.WithDescription("Promote short-term buffer to long-term vector store for the given session"),
 		mcp.WithString("session_id", mcp.Required()),
@@ -307,7 +419,7 @@ func main() {
 		return mcp.NewToolResultText("flushed"), nil
 	})
 
-	// ---- Tool: memory.store_long(session_id, content, metadata_json) -> MemoryRecord ----
+	// ---- Tool: memory.store_long ----
 	storeLong := mcp.NewTool("memory.store_long",
 		mcp.WithDescription("Embed, score and persist a long-term memory (uses Engine)"),
 		mcp.WithString("session_id", mcp.Required()),
@@ -356,7 +468,33 @@ func main() {
 		log.Printf("[memory-bank] retrieve_context: session=%s query=%s limit=%d\n", sessionID, query, limit)
 
 		recs, err := app.sm.RetrieveContext(ctx, sessionID, query, limit)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
+		return mcp.NewToolResultJSON(map[string]any{
+			"session_id": sessionID,
+			"query":      query,
+			"limit":      limit,
+			"results":    recs,
+		})
+	})
+
+	// Tool: memory_query
+	memoryQuery := mcp.NewTool(
+		"memory_query",
+		mcp.WithDescription("Perform a semantic search/vector search on the content in the memory."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("query", mcp.Required()),
+		mcp.WithNumber("limit", mcp.Description("Number of records to return (default 10)")),
+	)
+	s.AddTool(memoryQuery, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sessionID, _ := req.RequireString("session_id")
+		query, _ := req.RequireString("query")
+		limit := int(req.GetInt("limit", 10))
+		log.Printf("[memory-bank] memory_query: session=%s query=%s limit=%d\n", sessionID, query, limit)
+
+		recs, err := app.sm.RetrieveContext(ctx, sessionID, query, limit)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -388,26 +526,21 @@ func main() {
 			limit = 5
 		}
 
-		// Step 1: Embed content
 		e, err := app.sm.Embed(ctx, content)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("embed failed: %v", err)), nil
 		}
 
-		// Step 2: Store in short-term memory
 		app.sm.AddShortTerm(sid, content, "{}", e)
 
-		// Step 3: Flush to long-term memory
 		if err := app.sm.FlushToLongTerm(ctx, sid); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("flush failed: %v", err)), nil
 		}
 
-		// Step 4: Retrieve context (not returned, just to trigger semantic linkage)
 		if _, err := app.sm.RetrieveContext(ctx, sid, query, limit); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("retrieve failed: %v", err)), nil
 		}
 
-		// Step 5: Return simple status confirmation
 		out := map[string]any{
 			"status":   "Completed",
 			"session":  sid,
@@ -419,7 +552,58 @@ func main() {
 		return res, nil
 	})
 
-	// ---- Tools: spaces.* (ACL + TTL registry) ----
+	ag, err := kit.BuildAgent(ctx)
+	if err != nil {
+		panic(fmt.Errorf("build agent: %w", err))
+	}
+
+	// ---- Tool: memory.rag_reason ----
+	ragReason := mcp.NewTool("memory.rag_reason",
+		mcp.WithDescription("Perform RAG reasoning: retrieve semantic context from memory, run an LLM on it, and return reasoning text."),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("Memory session identifier")),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Query or task for reasoning")),
+		mcp.WithString("model", mcp.Description("LLM model to use (gemini, openai, etc.)")),
+		mcp.WithNumber("limit", mcp.Description("Number of context memories to include")),
+	)
+	s.AddTool(ragReason, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sid, _ := req.RequireString("session_id")
+		query, _ := req.RequireString("query")
+		model := getStringParam(req, "model")
+		if model == "" {
+			model = "gemini-2.0-pro"
+		}
+		limit := int(getNumberParam(req, "limit"))
+		if limit <= 0 {
+			limit = 6
+		}
+
+		recs, err := app.sm.RetrieveContext(ctx, sid, query, limit)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("context retrieval failed: %v", err)), nil
+		}
+
+		var contextBuilder strings.Builder
+		for i, r := range recs {
+			contextBuilder.WriteString(fmt.Sprintf("[Context %d] %s\n\n", i+1, r.Content))
+		}
+		prompt := fmt.Sprintf("You are a reasoning assistant. Use the following context to answer:\n\n%s\n\nQuestion: %s\n\nAnswer:", contextBuilder.String(), query)
+
+		resp, err := ag.Generate(ctx, sid, prompt)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("LLM call failed: %v", err)), nil
+		}
+
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"model":   model,
+			"session": sid,
+			"query":   query,
+			"context": len(recs),
+			"answer":  resp,
+		})
+		return res, nil
+	})
+
+	// ---- Tools: spaces.* ----
 	spacesUpsert := mcp.NewTool("spaces.upsert",
 		mcp.WithDescription("Create or update a space definition with TTL and ACL"),
 		mcp.WithString("name", mcp.Required()),
@@ -514,7 +698,7 @@ func main() {
 		return res, nil
 	})
 
-	// ---- Shared session convenience tools ----
+	// ---- Shared session tools ----
 	sharedJoin := mcp.NewTool("shared.join",
 		mcp.WithDescription("Ensure a principal view exists and join a space"),
 		mcp.WithString("principal", mcp.Required()),
@@ -636,21 +820,17 @@ func main() {
 	})
 
 	// ---- start transport ----
-	// ---- start transport ----
 	switch strings.ToLower(*transport) {
 	case "stdio":
 		if err := server.ServeStdio(s); err != nil {
 			log.Fatal(err)
 		}
-		// Create a plain HTTP handler that uses the MCP server's HandleRequest method
 	case "http":
 		log.SetOutput(os.Stderr)
 		log.Printf("[MCP] Starting HTTP server on %s", *addr)
 
-		// Create streamable MCP HTTP server (official supported interface)
 		h := server.NewStreamableHTTPServer(s)
 
-		// Start the HTTP listener
 		if err := h.Start(*addr); err != nil {
 			log.Fatalf("failed to start MCP HTTP server: %v", err)
 		}
@@ -658,7 +838,6 @@ func main() {
 	default:
 		log.Fatal("unknown transport: ", *transport)
 	}
-
 }
 
 // --- helpers ---
@@ -668,6 +847,23 @@ func env(k, def string) string {
 	}
 	return def
 }
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envIntOrDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
 func mustEnv(k string) string {
 	v := os.Getenv(k)
 	if v == "" {
@@ -675,6 +871,7 @@ func mustEnv(k string) string {
 	}
 	return v
 }
+
 func atoi(s string, def int) int {
 	i, err := strconv.Atoi(s)
 	if err != nil {
