@@ -61,32 +61,41 @@ func loadGeminiSettings() (*GeminiSettings, error) {
 
 	settingsPath := filepath.Join(home, ".gemini", "settings.json")
 
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Return default settings if file doesn't exist
-			log.Printf("No .gemini/settings.json found, using defaults")
-			return &GeminiSettings{
-				LLMModel:         "gemini-2.5-pro",
-				MemoryStore:      "qdrant",
-				QdrantURL:        "http://localhost:6334",
-				QdrantCollection: "memories",
-				ShortTermSize:    500000,
-				DefaultSpaceTTL:  86400,
-			}, nil
-		}
-		return nil, fmt.Errorf("failed to read settings file: %w", err)
-	}
-
 	var settings GeminiSettings
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, fmt.Errorf("failed to parse settings JSON: %w", err)
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return nil, fmt.Errorf("failed to parse settings JSON: %w", err)
+		}
+		log.Printf("Loaded settings from %s", settingsPath)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read settings file: %w", err)
+	} else {
+		log.Printf("No .gemini/settings.json found, using defaults")
 	}
 
-	log.Printf("Loaded settings from %s", settingsPath)
+	// Apply defaults for any unset/empty fields
+	if settings.LLMModel == "" {
+		settings.LLMModel = "gemini-2.5-pro"
+	}
+	if settings.MemoryStore == "" {
+		settings.MemoryStore = "qdrant"
+	}
+	if settings.QdrantURL == "" {
+		settings.QdrantURL = "http://localhost:6333"
+	}
+	if settings.QdrantCollection == "" {
+		settings.QdrantCollection = "memories"
+	}
+	if settings.ShortTermSize == 0 {
+		settings.ShortTermSize = 500000
+	}
+	if settings.DefaultSpaceTTL == 0 {
+		settings.DefaultSpaceTTL = 86400
+	}
+	// Add similar checks for other fields like QdrantAPIKey, PostgresDSN, etc., if needed
+
 	return &settings, nil
 }
-
 func newApp(ctx context.Context, settings *GeminiSettings) (*App, error) {
 	// Use settings with environment variable fallbacks
 	storeKind := strings.ToLower(envOrDefault("MEMORY_STORE", settings.MemoryStore))
@@ -241,7 +250,7 @@ func main() {
 	}
 
 	s := server.NewMCPServer(
-		"memor-bank",
+		"memory-bank",
 		"0.1.0",
 		server.WithToolCapabilities(true),
 		server.WithRecovery(),
@@ -275,6 +284,7 @@ func main() {
 	})
 
 	// Tool: memory.store_codebase
+	// Tool: memory.store_codebase (FIXED VERSION)
 	storeCodebase := mcp.NewTool("store_codebase",
 		mcp.WithDescription("Recursively store codebase files into memory context"),
 		mcp.WithString("session_id", mcp.Required()),
@@ -285,8 +295,32 @@ func main() {
 		sid, _ := req.RequireString("session_id")
 		root, _ := req.RequireString("path")
 
+		// FIX 1: Expand home directory if path starts with ~
+		if strings.HasPrefix(root, "~") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("failed to get home directory: %v", err)), nil
+			}
+			root = filepath.Join(home, root[1:])
+		}
+
+		// FIX 2: Convert to absolute path if relative
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to resolve absolute path: %v", err)), nil
+		}
+		root = absRoot
+
+		// FIX 3: Verify path exists before walking
+		if _, err := os.Stat(root); err != nil {
+			if os.IsNotExist(err) {
+				return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", root)), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("cannot access path: %v", err)), nil
+		}
+
 		extsParam := getStringParam(req, "extensions")
-		log.Printf("DEBUG: extensions param = '%s'\n", extsParam)
+		log.Printf("DEBUG: store_codebase called with path='%s', extensions='%s'\n", root, extsParam)
 
 		allowed := map[string]bool{}
 		if extsParam != "" {
@@ -304,30 +338,70 @@ func main() {
 		}
 
 		log.Printf("✅ Allowed extensions: %v (empty = all files)\n", allowed)
+		log.Printf("🔍 Starting walk from: %s\n", root)
 
 		count := 0
 		skipped := 0
+		errors := []string{}
 
-		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		// FIX 4: Better error handling - don't fail entire walk on single file errors
+		err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			// If there's an error accessing this specific path, log and continue
 			if err != nil {
-				return err
+				log.Printf("⚠️  Error accessing %s: %v (continuing...)\n", path, err)
+				errors = append(errors, fmt.Sprintf("%s: %v", path, err))
+				return nil // Continue walking despite error
 			}
+
+			// Skip directories
 			if d.IsDir() {
+				// FIX 5: Skip common directories that should be ignored
+				name := d.Name()
+				if name == ".git" || name == "node_modules" || name == "vendor" ||
+					name == ".idea" || name == "__pycache__" || name == ".vscode" {
+					log.Printf("⏭️  Skipping directory: %s\n", path)
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
 			ext := filepath.Ext(path)
 
+			// Apply extension filter
 			if len(allowed) > 0 && !allowed[ext] {
 				skipped++
 				return nil
 			}
 
-			fmt.Printf("📄 Processing file: %s (ext: %s)\n", path, ext)
+			log.Printf("📄 Processing file: %s (ext: %s)\n", path, ext)
+
+			// Read file with size limit check
+			info, err := d.Info()
+			if err != nil {
+				log.Printf("❌ stat failed for %s: %v\n", path, err)
+				errors = append(errors, fmt.Sprintf("stat %s: %v", path, err))
+				return nil
+			}
+
+			// FIX 6: Skip files that are too large (>10MB)
+			const maxFileSize = 10 * 1024 * 1024 // 10MB
+			if info.Size() > maxFileSize {
+				log.Printf("⏭️  Skipping large file: %s (%d bytes)\n", path, info.Size())
+				skipped++
+				return nil
+			}
 
 			data, err := os.ReadFile(path)
 			if err != nil {
-				log.Printf("❌ read failed: %v", err)
+				log.Printf("❌ read failed: %v\n", err)
+				errors = append(errors, fmt.Sprintf("read %s: %v", path, err))
+				return nil
+			}
+
+			// FIX 7: Skip binary files (files with null bytes)
+			if len(data) > 0 && isBinaryContent(data) {
+				log.Printf("⏭️  Skipping binary file: %s\n", path)
+				skipped++
 				return nil
 			}
 
@@ -340,26 +414,42 @@ func main() {
 
 			_, err = app.engine.Store(ctx, sid, string(data), meta)
 			if err != nil {
-				log.Printf("❌ store failed for %s: %v", path, err)
+				log.Printf("❌ store failed for %s: %v\n", path, err)
+				errors = append(errors, fmt.Sprintf("store %s: %v", path, err))
 			} else {
 				count++
-				fmt.Printf("✅ Stored: %s\n", path)
+				log.Printf("✅ Stored: %s (%d bytes)\n", path, len(data))
 			}
 			return nil
 		})
 
+		// FIX 8: Only fail if the walk itself failed, not individual files
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("walk error: %v", err)), nil
 		}
 
-		log.Printf("📊 Summary: %d files stored, %d files skipped\n", count, skipped)
+		log.Printf("📊 Summary: %d files stored, %d files skipped, %d errors\n", count, skipped, len(errors))
 
-		res, _ := mcp.NewToolResultJSON(map[string]any{
+		result := map[string]any{
 			"stored_files":  count,
 			"skipped_files": skipped,
 			"path":          root,
 			"extensions":    extsParam,
-		})
+			"error_count":   len(errors),
+		}
+
+		if len(errors) > 0 {
+			// Include first 10 errors in response
+			maxErrors := 10
+			if len(errors) > maxErrors {
+				result["errors"] = errors[:maxErrors]
+				result["errors_truncated"] = true
+			} else {
+				result["errors"] = errors
+			}
+		}
+
+		res, _ := mcp.NewToolResultJSON(result)
 		return res, nil
 	})
 
@@ -570,7 +660,7 @@ func main() {
 		query, _ := req.RequireString("query")
 		model := getStringParam(req, "model")
 		if model == "" {
-			model = "gemini-2.0-pro"
+			model = "gemini-2.5-pro"
 		}
 		limit := int(getNumberParam(req, "limit"))
 		if limit <= 0 {
@@ -840,14 +930,6 @@ func main() {
 	}
 }
 
-// --- helpers ---
-func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -895,4 +977,19 @@ func parseRole(s string) memory.SpaceRole {
 func stringMapToJSON(m map[string]string) string {
 	b, _ := json.Marshal(m)
 	return string(b)
+}
+
+func isBinaryContent(data []byte) bool {
+	// Check first 8192 bytes for null bytes (binary indicator)
+	checkLen := 8192
+	if len(data) < checkLen {
+		checkLen = len(data)
+	}
+
+	for i := 0; i < checkLen; i++ {
+		if data[i] == 0 {
+			return true
+		}
+	}
+	return false
 }
