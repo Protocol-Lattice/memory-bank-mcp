@@ -18,6 +18,7 @@ import (
 	"github.com/Protocol-Lattice/go-agent/src/adk"
 	adkmodules "github.com/Protocol-Lattice/go-agent/src/adk/modules"
 	"github.com/Protocol-Lattice/go-agent/src/memory"
+	"github.com/Protocol-Lattice/go-agent/src/memory/embed"
 	"github.com/Protocol-Lattice/go-agent/src/memory/engine"
 	"github.com/Protocol-Lattice/go-agent/src/models"
 	"github.com/Protocol-Lattice/go-agent/src/subagents"
@@ -71,11 +72,6 @@ func loadGeminiSettings() (*GeminiSettings, error) {
 		return nil, fmt.Errorf("failed to read settings file: %w", err)
 	} else {
 		log.Printf("No .gemini/settings.json found, using defaults")
-	}
-
-	// Apply defaults for any unset/empty fields
-	if settings.LLMModel == "" {
-		settings.LLMModel = "gemini-2.5-pro"
 	}
 	if settings.MemoryStore == "" {
 		settings.MemoryStore = "qdrant"
@@ -212,14 +208,14 @@ func main() {
 	memOpts := engine.DefaultOptions()
 
 	// Use settings with environment variable overrides
-	llmModel := envOrDefault("LLM_MODEL", settings.LLMModel)
+	llmModel := envOrDefault("LLM_MODEL", "gemma3:1b")
 	qdrantURL := envOrDefault("QDRANT_URL", settings.QdrantURL)
 	qdrantCollection := envOrDefault("QDRANT_COLLECTION", settings.QdrantCollection)
 
 	log.Printf("Configuration: LLM=%s, Store=%s, Qdrant=%s/%s",
 		llmModel, settings.MemoryStore, qdrantURL, qdrantCollection)
 
-	researcherModel, err := models.NewGeminiLLM(ctx, llmModel, "Research summary:")
+	researcherModel, err := models.NewOllamaLLM(llmModel, "Code refactoring:")
 	if err != nil {
 		log.Fatalf("failed to create researcher model: %v", err)
 	}
@@ -229,14 +225,14 @@ func main() {
 		adk.WithDefaultSystemPrompt("You orchestrate a helpful assistant team."),
 		adk.WithSubAgents(subagents.NewResearcher(researcherModel)),
 		adk.WithModules(
-			adkmodules.NewModelModule("gemini-model", func(_ context.Context) (models.Agent, error) {
-				return models.NewGeminiLLM(ctx, llmModel, "Swarm orchestration:")
+			adkmodules.NewModelModule("ollama", func(_ context.Context) (models.Agent, error) {
+				return models.NewOllamaLLM(llmModel, "Swarm orchestration:")
 			}),
 			adkmodules.InQdrantMemory(
 				100000,
 				qdrantURL,
 				qdrantCollection,
-				memory.AutoEmbedder(),
+				embed.AutoEmbedder(),
 				&memOpts,
 			),
 			adkmodules.NewToolModule(
@@ -458,7 +454,7 @@ func main() {
 		return res, nil
 	})
 
-	initTool := mcp.NewTool("initialize",
+	initTool := mcp.NewTool("memory.initialize",
 		mcp.WithDescription("Generate a new session ID"))
 	s.AddTool(initTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sid := fmt.Sprintf("sess-%d", time.Now().UnixNano())
@@ -468,7 +464,7 @@ func main() {
 
 	// ---- Tool: filesystem.apply_refactor ----
 	applyRefactor := mcp.NewTool(
-		"filesystem.apply_refactor",
+		"apply_refactor",
 		mcp.WithDescription("Retrieve code from memory, refactor it using the LLM, and write the updated files back to disk."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
@@ -594,7 +590,7 @@ func main() {
 
 	// ---- Tool: filesystem.get_and_refactor ----
 	refactorFS := mcp.NewTool(
-		"filesystem.get_and_refactor",
+		"get_and_refactor",
 		mcp.WithDescription("Retrieve semantically relevant code from memory and refactor it using an LLM."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
@@ -658,7 +654,7 @@ func main() {
 	})
 
 	// ---- Tool: memory.add_short ----
-	addShort := mcp.NewTool("memory.add_short",
+	addShort := mcp.NewTool("add_short",
 		mcp.WithDescription("Append short-term memory to a session buffer (flush later to long-term)"),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("content", mcp.Required()),
@@ -740,7 +736,7 @@ func main() {
 
 	// Tool: retrieve_context
 	retrieveCtx := mcp.NewTool(
-		"retrieve_context",
+		"memory.retrieve_context",
 		mcp.WithDescription("Retrieve relevant memory records based on a semantic query."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
@@ -768,7 +764,7 @@ func main() {
 
 	// Tool: memory_query
 	memoryQuery := mcp.NewTool(
-		"memory_query",
+		"memory.memory_query",
 		mcp.WithDescription("Perform a semantic search/vector search on the content in the memory."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
@@ -851,7 +847,7 @@ func main() {
 		query, _ := req.RequireString("query")
 		model := getStringParam(req, "model")
 		if model == "" {
-			model = "gemini-2.5-pro"
+			model = "gemma3:1b"
 		}
 		limit := int(getNumberParam(req, "limit"))
 		if limit <= 0 {

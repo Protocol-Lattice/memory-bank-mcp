@@ -27,7 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create UTCP client: %v", err)
 	}
-	tools, err := client.SearchTools("", 30)
+	tools, err := client.SearchTools("", 40)
 	if err != nil {
 		log.Fatalf("❌ Failed to search tools: %v", err)
 	}
@@ -37,11 +37,23 @@ func main() {
 	}
 
 	session := "refactor-session"
-	rootOut := filepath.Join(home, "Desktop", "go-utcp-refactored")
+	rootOut := filepath.Join(home, "Desktop", "go-utcp")
+	res, err := client.CallTool(ctx, "memory-http.store_codebase", map[string]any{
+		"session_id": session,
+		"path":       rootOut,
+		"extensions": ".go,.md,.json",
+	})
+
+	if err != nil {
+		log.Fatalf("❌ Store codebase failed: %v", err)
+	}
+
+	fmt.Println("✅ Codebase stored successfully!")
+	fmt.Printf("📄 Stored files: %v\n", res)
 
 	// --- 2. Apply refactor ---
-	fmt.Println("🛠  Applying refactor using filesystem.apply_refactor...")
-	refactorRes, err := client.CallTool(ctx, "memory.filesystem_apply_refactor", map[string]any{
+	fmt.Println("🛠  Applying refactor using memory.apply_refactor...")
+	refactorRes, err := client.CallTool(ctx, "memory-http.apply_refactor", map[string]any{
 		"session_id":   session,
 		"query":        "Refactor code for maintainability",
 		"instructions": "Use idiomatic Go and improve modularity",
