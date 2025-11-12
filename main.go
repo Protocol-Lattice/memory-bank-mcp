@@ -191,6 +191,7 @@ func main() {
 		transport = flag.String("transport", "stdio", "stdio|http")
 		addr      = flag.String("addr", ":8080", "addr for http")
 	)
+
 	flag.Parse()
 
 	ctx := context.Background()
@@ -208,14 +209,14 @@ func main() {
 	memOpts := engine.DefaultOptions()
 
 	// Use settings with environment variable overrides
-	llmModel := envOrDefault("LLM_MODEL", "gemma3:1b")
+	llmModel := envOrDefault("LLM_MODEL", "gemini-2.5-pro")
 	qdrantURL := envOrDefault("QDRANT_URL", settings.QdrantURL)
 	qdrantCollection := envOrDefault("QDRANT_COLLECTION", settings.QdrantCollection)
 
 	log.Printf("Configuration: LLM=%s, Store=%s, Qdrant=%s/%s",
 		llmModel, settings.MemoryStore, qdrantURL, qdrantCollection)
 
-	researcherModel, err := models.NewOllamaLLM(llmModel, "Code refactoring:")
+	researcherModel, err := models.NewGeminiLLM(ctx, llmModel, "Code refactoring:")
 	if err != nil {
 		log.Fatalf("failed to create researcher model: %v", err)
 	}
@@ -226,7 +227,7 @@ func main() {
 		adk.WithSubAgents(subagents.NewResearcher(researcherModel)),
 		adk.WithModules(
 			adkmodules.NewModelModule("ollama", func(_ context.Context) (models.Agent, error) {
-				return models.NewOllamaLLM(llmModel, "Swarm orchestration:")
+				return models.NewGeminiLLM(ctx, llmModel, "Swarm orchestration:")
 			}),
 			adkmodules.InQdrantMemory(
 				100000,
@@ -284,9 +285,8 @@ func main() {
 		return res, nil
 	})
 
-	// Tool: memory.store_codebase
-	// Tool: memory.store_codebase (FIXED VERSION)
-	storeCodebase := mcp.NewTool("store_codebase",
+	storeCodebase := mcp.NewTool(
+		"store_codebase",
 		mcp.WithDescription("Recursively store codebase files into memory context"),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("path", mcp.Required()),
@@ -295,8 +295,9 @@ func main() {
 	s.AddTool(storeCodebase, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sid, _ := req.RequireString("session_id")
 		root, _ := req.RequireString("path")
+		root = filepath.Clean(root)
 
-		// FIX 1: Expand home directory if path starts with ~
+		// Expand ~ to home directory
 		if strings.HasPrefix(root, "~") {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -305,14 +306,14 @@ func main() {
 			root = filepath.Join(home, root[1:])
 		}
 
-		// FIX 2: Convert to absolute path if relative
+		// Convert to absolute path
 		absRoot, err := filepath.Abs(root)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("failed to resolve absolute path: %v", err)), nil
 		}
 		root = absRoot
 
-		// FIX 3: Verify path exists before walking
+		// Verify path exists
 		if _, err := os.Stat(root); err != nil {
 			if os.IsNotExist(err) {
 				return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", root)), nil
@@ -345,18 +346,14 @@ func main() {
 		skipped := 0
 		errors := []string{}
 
-		// FIX 4: Better error handling - don't fail entire walk on single file errors
 		err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-			// If there's an error accessing this specific path, log and continue
 			if err != nil {
 				log.Printf("⚠️  Error accessing %s: %v (continuing...)\n", path, err)
 				errors = append(errors, fmt.Sprintf("%s: %v", path, err))
-				return nil // Continue walking despite error
+				return nil
 			}
 
-			// Skip directories
 			if d.IsDir() {
-				// FIX 5: Skip common directories that should be ignored
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "vendor" ||
 					name == ".idea" || name == "__pycache__" || name == ".vscode" {
@@ -367,8 +364,6 @@ func main() {
 			}
 
 			ext := filepath.Ext(path)
-
-			// Apply extension filter
 			if len(allowed) > 0 && !allowed[ext] {
 				skipped++
 				return nil
@@ -376,7 +371,6 @@ func main() {
 
 			log.Printf("📄 Processing file: %s (ext: %s)\n", path, ext)
 
-			// Read file with size limit check
 			info, err := d.Info()
 			if err != nil {
 				log.Printf("❌ stat failed for %s: %v\n", path, err)
@@ -384,7 +378,6 @@ func main() {
 				return nil
 			}
 
-			// FIX 6: Skip files that are too large (>10MB)
 			const maxFileSize = 10 * 1024 * 1024 // 10MB
 			if info.Size() > maxFileSize {
 				log.Printf("⏭️  Skipping large file: %s (%d bytes)\n", path, info.Size())
@@ -399,18 +392,23 @@ func main() {
 				return nil
 			}
 
-			// FIX 7: Skip binary files (files with null bytes)
 			if len(data) > 0 && isBinaryContent(data) {
 				log.Printf("⏭️  Skipping binary file: %s\n", path)
 				skipped++
 				return nil
 			}
 
+			relPath, err := filepath.Rel(root, path)
+			if err != nil || strings.HasPrefix(relPath, "..") {
+				relPath = filepath.Base(path)
+			}
+
 			meta := map[string]any{
-				"path": path,
+				"path": relPath, // store relative path for LLM-friendly retrieval
 				"type": "code",
 				"ext":  ext,
 				"size": len(data),
+				"code": string(data),
 			}
 
 			_, err = app.engine.Store(ctx, sid, string(data), meta)
@@ -421,10 +419,10 @@ func main() {
 				count++
 				log.Printf("✅ Stored: %s (%d bytes)\n", path, len(data))
 			}
+
 			return nil
 		})
 
-		// FIX 8: Only fail if the walk itself failed, not individual files
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("walk error: %v", err)), nil
 		}
@@ -440,7 +438,6 @@ func main() {
 		}
 
 		if len(errors) > 0 {
-			// Include first 10 errors in response
 			maxErrors := 10
 			if len(errors) > maxErrors {
 				result["errors"] = errors[:maxErrors]
@@ -454,15 +451,16 @@ func main() {
 		return res, nil
 	})
 
-	initTool := mcp.NewTool("memory.initialize",
+	initTool := mcp.NewTool("initialize",
 		mcp.WithDescription("Generate a new session ID"))
 	s.AddTool(initTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sid := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 		res, _ := mcp.NewToolResultJSON(map[string]string{"session_id": sid})
 		return res, nil
 	})
+	// Improved apply_refactor tool handler
+	// This refactor ensures files are always written correctly even if LLM omits <path> headers.
 
-	// ---- Tool: filesystem.apply_refactor ----
 	applyRefactor := mcp.NewTool(
 		"apply_refactor",
 		mcp.WithDescription("Retrieve code from memory, refactor it using the LLM, and write the updated files back to disk."),
@@ -472,23 +470,22 @@ func main() {
 		mcp.WithString("root_path", mcp.Required(), mcp.Description("Root directory where refactored files will be written")),
 		mcp.WithNumber("limit", mcp.Description("Number of snippets to retrieve (default 8)")),
 	)
-	s.AddTool(applyRefactor, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 
+	s.AddTool(applyRefactor, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sessionID, _ := req.RequireString("session_id")
 		query, _ := req.RequireString("query")
 		instructions, _ := req.RequireString("instructions")
 		rootPath, _ := req.RequireString("root_path")
-
 		limit := int(req.GetInt("limit", 8))
 
-		// Expand ~ and resolve root dir
+		// Expand and resolve root dir
 		if strings.HasPrefix(rootPath, "~") {
 			home, _ := os.UserHomeDir()
 			rootPath = filepath.Join(home, rootPath[1:])
 		}
 		rootPath, _ = filepath.Abs(rootPath)
 
-		// Retrieve relevant code from memory
+		// Retrieve code snippets from memory
 		recs, err := app.sm.RetrieveContext(ctx, sessionID, query, limit)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("context retrieval failed: %v", err)), nil
@@ -497,57 +494,49 @@ func main() {
 			return mcp.NewToolResultError("no relevant code found"), nil
 		}
 
-		// Build prompt for refactor
-		var b strings.Builder
-		b.WriteString("You are an expert senior software engineer performing a professional refactoring pass.\n\n")
-
-		b.WriteString("### Instructions:\n")
-		b.WriteString(instructions + "\n\n")
-
-		b.WriteString("### Code Snippets:\n")
-
+		// Build prompt with metadata-aware snippets
+		var snippetBuilder strings.Builder
 		for i, r := range recs {
-			// ✅ Safe fallback if metadata or path missing
-			path := fmt.Sprintf("snippet_%d.go", i+1)
-			if r.Metadata != "" {
-				if r.Metadata != "" {
-					path = r.Metadata
-				}
+			meta := map[string]any{}
+			_ = json.Unmarshal([]byte(r.Metadata), &meta)
+			relPath := fmt.Sprintf("snippet_%d.go", i+1)
+			if p, ok := meta["path"].(string); ok && p != "" {
+				relPath = p
 			}
-
-			b.WriteString(fmt.Sprintf(
-				"\n===== [%d] %s =====\n%s\n",
-				i+1, path, r.Content,
-			))
+			snippetBuilder.WriteString(fmt.Sprintf("\n===== [%d] %s =====\n%s\n", i+1, relPath, r.Content))
 		}
 
-		b.WriteString("\n### Output Requirements:\n")
-		b.WriteString("Return ONLY the refactored code.\n")
-		b.WriteString("If multiple files are implied, separate them using:\n")
-		b.WriteString("===== <relative/path.go> =====\n<code>\n")
+		prompt := fmt.Sprintf(`You are an expert software engineer performing a professional refactoring pass.
 
-		prompt := b.String()
+### Instructions:
+%s
 
-		// Run LLM
+### Code Snippets:
+%s
+
+### Output Requirements:
+- For each file, start with its relative path in angle brackets like this:
+  ===== <relative/path/to/file.go> =====
+  <refactored code>
+- Maintain original relative paths if possible.
+- Output only valid code blocks (no commentary, no markdown fences).
+`, instructions, snippetBuilder.String())
+
+		// Call LLM
 		response, err := ag.Generate(ctx, sessionID, prompt)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("LLM call failed: %v", err)), nil
 		}
 
-		output := response
+		cleaned := strings.ReplaceAll(response, "```go", "")
+		cleaned = strings.ReplaceAll(cleaned, "```", "")
 
-		// Parse output into file blocks
-		blocks := strings.Split(output, "=====")
+		blocks := strings.Split(cleaned, "=====")
 		written := []string{}
 
-		for _, blk := range blocks {
+		for i, blk := range blocks {
 			blk = strings.TrimSpace(blk)
 			if blk == "" {
-				continue
-			}
-
-			// ✅ Must begin with <path>
-			if !strings.HasPrefix(blk, "<") {
 				continue
 			}
 
@@ -555,100 +544,53 @@ func main() {
 			header := strings.TrimSpace(lines[0])
 			code := ""
 			if len(lines) > 1 {
-				code = lines[1]
+				code = strings.TrimSpace(lines[1])
 			}
 
-			// ✅ Extract path safely
-			rel := strings.Trim(header, "<> ")
-			if rel == "" || rel == ">" || strings.Contains(rel, " ") {
-				// fallback safe filename
-				rel = fmt.Sprintf("refactored_%d.go", len(written)+1)
+			var relativePath string
+			if strings.HasPrefix(header, "<") && strings.HasSuffix(header, ">") {
+				relativePath = strings.Trim(header, "<> ")
+			} else {
+				// fallback: restore original metadata path
+				if i < len(recs) {
+					meta := map[string]any{}
+					_ = json.Unmarshal([]byte(recs[i].Metadata), &meta)
+					if p, ok := meta["path"].(string); ok && p != "" {
+						relativePath = p
+					} else {
+						relativePath = fmt.Sprintf("snippet_%d.go", i+1)
+					}
+				} else {
+					relativePath = fmt.Sprintf("snippet_%d.go", i+1)
+				}
+				log.Printf("⚠️  Missing header, using fallback path: %s", relativePath)
 			}
 
-			abs := filepath.Join(rootPath, rel)
-
-			// mkdir -p
-			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("mkdir error for %s: %v", abs, err)), nil
+			targetPath := filepath.Join(rootPath, relativePath)
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("mkdir error for %s: %v", targetPath, err)), nil
 			}
 
-			// Write file
-			if err := os.WriteFile(abs, []byte(code), 0o644); err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("write error for %s: %v", abs, err)), nil
+			// backup old file
+			if _, err := os.Stat(targetPath); err == nil {
+				_ = os.Rename(targetPath, targetPath+".bak")
 			}
 
-			written = append(written, abs)
+			if err := os.WriteFile(targetPath, []byte(code), 0o644); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("write error for %s: %v", targetPath, err)), nil
+			}
+
+			written = append(written, targetPath)
+		}
+
+		if len(written) == 0 {
+			return mcp.NewToolResultError("no valid file blocks found in LLM output"), nil
 		}
 
 		res, _ := mcp.NewToolResultJSON(map[string]any{
 			"written_files": written,
 			"count":         len(written),
 			"root":          rootPath,
-		})
-		return res, nil
-	})
-
-	// ---- Tool: filesystem.get_and_refactor ----
-	refactorFS := mcp.NewTool(
-		"get_and_refactor",
-		mcp.WithDescription("Retrieve semantically relevant code from memory and refactor it using an LLM."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("query", mcp.Required()),
-		mcp.WithNumber("limit", mcp.Description("Number of files to retrieve (default 5)")),
-		mcp.WithString("instructions", mcp.Description("Refactor instructions for the LLM")),
-	)
-
-	s.AddTool(refactorFS, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sessionID, _ := req.RequireString("session_id")
-		query, _ := req.RequireString("query")
-
-		limit := int(getNumberParam(req, "limit"))
-		if limit <= 0 {
-			limit = 5
-		}
-
-		instructions := getStringParam(req, "instructions")
-		if instructions == "" {
-			instructions = "Refactor the following code for clarity, maintainability, and idiomatic best practices."
-		}
-
-		// ✅ 1. Retrieve relevant code from memory (semantic search)
-		recs, err := app.sm.RetrieveContext(ctx, sessionID, query, limit)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("context retrieval failed: %v", err)), nil
-		}
-
-		if len(recs) == 0 {
-			return mcp.NewToolResultText("No relevant code found."), nil
-		}
-
-		// ✅ 2. Build refactor prompt
-		var b strings.Builder
-		b.WriteString("You are an expert software engineer.\n")
-		b.WriteString("Refactor the following code according to the instructions.\n\n")
-		b.WriteString("### Instructions:\n")
-		b.WriteString(instructions + "\n\n")
-		b.WriteString("### Code Snippets:\n\n")
-
-		for i, r := range recs {
-			b.WriteString(fmt.Sprintf("-----[Code %d from %s]-----\n%s\n\n", i+1, r.Metadata, r.Content))
-		}
-
-		b.WriteString("### Output:\nReturn ONLY the refactored code. Do not add commentary.\n")
-
-		prompt := b.String()
-
-		// ✅ 3. Run LLM refactor
-		resp, err := ag.Generate(ctx, sessionID, prompt)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("LLM refactor failed: %v", err)), nil
-		}
-
-		// ✅ 4. Return refactored code
-		res, _ := mcp.NewToolResultJSON(map[string]any{
-			"query":          query,
-			"refactoredCode": resp,
-			"sources_used":   len(recs),
 		})
 		return res, nil
 	})
@@ -686,7 +628,7 @@ func main() {
 	})
 
 	// ---- Tool: memory.flush ----
-	flush := mcp.NewTool("memory.flush",
+	flush := mcp.NewTool("flush",
 		mcp.WithDescription("Promote short-term buffer to long-term vector store for the given session"),
 		mcp.WithString("session_id", mcp.Required()),
 	)
@@ -702,7 +644,7 @@ func main() {
 	})
 
 	// ---- Tool: memory.store_long ----
-	storeLong := mcp.NewTool("memory.store_long",
+	storeLong := mcp.NewTool("store_long",
 		mcp.WithDescription("Embed, score and persist a long-term memory (uses Engine)"),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("content", mcp.Required()),
@@ -764,7 +706,7 @@ func main() {
 
 	// Tool: memory_query
 	memoryQuery := mcp.NewTool(
-		"memory.memory_query",
+		"memory.query",
 		mcp.WithDescription("Perform a semantic search/vector search on the content in the memory."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("query", mcp.Required()),
@@ -789,7 +731,7 @@ func main() {
 		})
 	})
 
-	chainPrompt := mcp.NewTool("memory.chain_prompt",
+	chainPrompt := mcp.NewTool("chain_prompt",
 		mcp.WithDescription("Embed, store, flush, retrieve, and return a prompt with context memories"),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("Memory session identifier")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("New content to store and embed")),
@@ -835,7 +777,7 @@ func main() {
 	})
 
 	// ---- Tool: memory.rag_reason ----
-	ragReason := mcp.NewTool("memory.rag_reason",
+	ragReason := mcp.NewTool("rag_reason",
 		mcp.WithDescription("Perform RAG reasoning: retrieve semantic context from memory, run an LLM on it, and return reasoning text."),
 		mcp.WithString("session_id", mcp.Required(), mcp.Description("Memory session identifier")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Query or task for reasoning")),
@@ -1090,7 +1032,7 @@ func main() {
 		return res, nil
 	})
 
-	metrics := mcp.NewTool("engine.metrics", mcp.WithDescription("Return engine metrics snapshot"))
+	metrics := mcp.NewTool("engine.metrics", mcp.WithDescription("Return engine metrics snapshot")) // This was already correct, but including for completeness
 	s.AddTool(metrics, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		res, _ := mcp.NewToolResultJSON(app.engine.MetricsSnapshot())
 		return res, nil

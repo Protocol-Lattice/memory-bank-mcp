@@ -27,44 +27,59 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create UTCP client: %v", err)
 	}
+
 	tools, err := client.SearchTools("", 40)
 	if err != nil {
 		log.Fatalf("❌ Failed to search tools: %v", err)
 	}
 
+	fmt.Println("Available tools:")
 	for _, tool := range tools {
-		fmt.Println(tool.Name)
+		fmt.Println("  -", tool.Name)
 	}
 
-	session := "refactor-session"
-	rootOut := filepath.Join(home, "Desktop", "go-utcp")
-	res, err := client.CallTool(ctx, "memory-http.store_codebase", map[string]any{
+	session := "refactor-session-1"
+	rootOut := filepath.Join(home, "Desktop", "go-agent")
+	params := map[string]any{
 		"session_id": session,
 		"path":       rootOut,
 		"extensions": ".go,.md,.json",
-	})
-
-	if err != nil {
-		log.Fatalf("❌ Store codebase failed: %v", err)
 	}
 
-	fmt.Println("✅ Codebase stored successfully!")
-	fmt.Printf("📄 Stored files: %v\n", res)
+	// Fixed: Use the correct tool name "memory.store_codebase"
+	toolName := "memory.store_codebase"
 
-	// --- 2. Apply refactor ---
-	fmt.Println("🛠  Applying refactor using memory.apply_refactor...")
-	refactorRes, err := client.CallTool(ctx, "memory-http.apply_refactor", map[string]any{
+	fmt.Printf("\n🔧 Calling tool: %s\n", toolName)
+	fmt.Printf("📁 Path: %s\n", rootOut)
+
+	res, err := client.CallTool(ctx, toolName, params)
+	if err != nil {
+		log.Fatalf("❌ Failed to call tool: %v", err)
+	}
+
+	fmt.Println("\n✅ Codebase stored successfully!")
+	fmt.Printf("📄 Result: %+v\n", res)
+
+	fmt.Println("\n🔄 Starting refactoring process...")
+
+	refactorParams := map[string]any{
 		"session_id":   session,
-		"query":        "Refactor code for maintainability",
-		"instructions": "Use idiomatic Go and improve modularity",
-		"root_path":    rootOut,
-		"limit":        120,
-	})
-
-	if err != nil {
-		log.Fatalf("❌ Refactor failed: %v", err)
+		"query":        "main function and tool calling logic",
+		"instructions": "Improve code structure, add error handling, and make it more maintainable. Add comments explaining key sections.",
+		"root_path":    filepath.Join(home, "Desktop", "go-agent"),
+		"limit":        10,
 	}
 
-	fmt.Println("✅ Refactor applied successfully!")
-	fmt.Printf("📄 Written files: %v\n", refactorRes)
+	refactorToolName := "memory.apply_refactor"
+	fmt.Printf("🔧 Calling tool: %s\n", refactorToolName)
+	fmt.Printf("📝 Query: %s\n", refactorParams["query"])
+	fmt.Printf("📁 Output path: %s\n", refactorParams["root_path"])
+
+	refactorRes, err := client.CallTool(ctx, refactorToolName, refactorParams)
+	if err != nil {
+		log.Fatalf("❌ Failed to call refactor tool: %v", err)
+	}
+
+	fmt.Println("\n✅ Refactoring completed successfully!")
+	fmt.Printf("📄 Refactor Result: %+v\n", refactorRes)
 }
