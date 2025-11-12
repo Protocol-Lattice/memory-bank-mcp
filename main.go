@@ -14,15 +14,7 @@ import (
 	"sync"
 	"time"
 
-	agent "github.com/Protocol-Lattice/go-agent"
-	"github.com/Protocol-Lattice/go-agent/src/adk"
-	adkmodules "github.com/Protocol-Lattice/go-agent/src/adk/modules"
 	"github.com/Protocol-Lattice/go-agent/src/memory"
-	"github.com/Protocol-Lattice/go-agent/src/memory/embed"
-	"github.com/Protocol-Lattice/go-agent/src/memory/engine"
-	"github.com/Protocol-Lattice/go-agent/src/models"
-	"github.com/Protocol-Lattice/go-agent/src/subagents"
-	"github.com/Protocol-Lattice/go-agent/src/tools"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -206,7 +198,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	memOpts := engine.DefaultOptions()
 
 	// Use settings with environment variable overrides
 	llmModel := envOrDefault("LLM_MODEL", "gemini-2.5-pro")
@@ -215,41 +206,6 @@ func main() {
 
 	log.Printf("Configuration: LLM=%s, Store=%s, Qdrant=%s/%s",
 		llmModel, settings.MemoryStore, qdrantURL, qdrantCollection)
-
-	researcherModel, err := models.NewGeminiLLM(ctx, llmModel, "Code refactoring:")
-	if err != nil {
-		log.Fatalf("failed to create researcher model: %v", err)
-	}
-
-	kit, err := adk.New(
-		ctx,
-		adk.WithDefaultSystemPrompt("You orchestrate a helpful assistant team."),
-		adk.WithSubAgents(subagents.NewResearcher(researcherModel)),
-		adk.WithModules(
-			adkmodules.NewModelModule("ollama", func(_ context.Context) (models.Agent, error) {
-				return models.NewGeminiLLM(ctx, llmModel, "Swarm orchestration:")
-			}),
-			adkmodules.InQdrantMemory(
-				100000,
-				qdrantURL,
-				qdrantCollection,
-				embed.AutoEmbedder(),
-				&memOpts,
-			),
-			adkmodules.NewToolModule(
-				"essentials",
-				adkmodules.StaticToolProvider([]agent.Tool{&tools.EchoTool{}}, nil),
-			),
-		),
-	)
-	if err != nil {
-		log.Fatalf("failed to initialise kit: %v", err)
-	}
-
-	ag, err := kit.BuildAgent(ctx)
-	if err != nil {
-		panic(fmt.Errorf("build agent: %w", err))
-	}
 
 	s := server.NewMCPServer(
 		"memory-bank",
@@ -637,52 +593,6 @@ func main() {
 		}
 
 		res, _ := mcp.NewToolResultJSON(out)
-		return res, nil
-	})
-
-	// ---- Tool: memory.rag_reason ----
-	ragReason := mcp.NewTool("rag_reason",
-		mcp.WithDescription("Perform RAG reasoning: retrieve semantic context from memory, run an LLM on it, and return reasoning text."),
-		mcp.WithString("session_id", mcp.Required(), mcp.Description("Memory session identifier")),
-		mcp.WithString("query", mcp.Required(), mcp.Description("Query or task for reasoning")),
-		mcp.WithString("model", mcp.Description("LLM model to use (gemini, openai, etc.)")),
-		mcp.WithNumber("limit", mcp.Description("Number of context memories to include")),
-	)
-	s.AddTool(ragReason, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sid, _ := req.RequireString("session_id")
-		query, _ := req.RequireString("query")
-		model := getStringParam(req, "model")
-		if model == "" {
-			model = "gemma3:1b"
-		}
-		limit := int(getNumberParam(req, "limit"))
-		if limit <= 0 {
-			limit = 6
-		}
-
-		recs, err := app.sm.RetrieveContext(ctx, sid, query, limit)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("context retrieval failed: %v", err)), nil
-		}
-
-		var contextBuilder strings.Builder
-		for i, r := range recs {
-			contextBuilder.WriteString(fmt.Sprintf("[Context %d] %s\n\n", i+1, r.Content))
-		}
-		prompt := fmt.Sprintf("You are a reasoning assistant. Use the following context to answer:\n\n%s\n\nQuestion: %s\n\nAnswer:", contextBuilder.String(), query)
-
-		resp, err := ag.Generate(ctx, sid, prompt)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("LLM call failed: %v", err)), nil
-		}
-
-		res, _ := mcp.NewToolResultJSON(map[string]any{
-			"model":   model,
-			"session": sid,
-			"query":   query,
-			"context": len(recs),
-			"answer":  resp,
-		})
 		return res, nil
 	})
 

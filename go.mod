@@ -5,7 +5,6 @@ go 1.25.0
 require (
 	github.com/Protocol-Lattice/go-agent v0.6.9
 	github.com/mark3labs/mcp-go v0.43.0
-	github.com/universal-tool-calling-protocol/go-utcp v1.7.1
 )
 
 require (
@@ -78,6 +77,7 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
+	github.com/universal-tool-calling-protocol/go-utcp v1.7.1 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
