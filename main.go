@@ -408,10 +408,152 @@ func main() {
 	})
 
 	initTool := mcp.NewTool("initialize",
-		mcp.WithDescription("Generate a new session ID"))
+		mcp.WithDescription("Generate a new session ID and save it to disk"))
 	s.AddTool(initTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sid := fmt.Sprintf("sess-%d", time.Now().UnixNano())
-		res, _ := mcp.NewToolResultJSON(map[string]string{"session_id": sid})
+
+		// Save the session ID to disk
+		if err := saveSessionID(sid); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to save session: %v", err)), nil
+		}
+
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"session_id": sid,
+			"saved":      true,
+		})
+		return res, nil
+	})
+
+	// Tool: prompt_with_memories - Enhanced version that uses stored session
+	promptWithMemories := mcp.NewTool("prompt_with_memories",
+		mcp.WithDescription("Build a prompt augmented with relevant memories from the session"),
+		mcp.WithString("session_id", mcp.Description("Session ID (optional, will use stored session if not provided)")),
+		mcp.WithString("query", mcp.Required(), mcp.Description("The user's query/prompt")),
+		mcp.WithNumber("limit", mcp.Description("Number of relevant memories to retrieve (default 5)")),
+		mcp.WithBoolean("include_short_term", mcp.Description("Include short-term memories (default true)")),
+	)
+	s.AddTool(promptWithMemories, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Get session ID - use provided or load from disk
+		sid := getStringParam(req, "session_id")
+		if sid == "" {
+			loadedSID, err := loadSessionID()
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("failed to load session: %v", err)), nil
+			}
+			if loadedSID == "" {
+				return mcp.NewToolResultError("no session_id provided and no saved session found. Use initialize or get_or_create_session first"), nil
+			}
+			sid = loadedSID
+		}
+
+		query, err := req.RequireString("query")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("missing query: %v", err)), nil
+		}
+
+		limit := int(getNumberParam(req, "limit"))
+		if limit <= 0 {
+			limit = 5
+		}
+
+		// Retrieve relevant memories
+		memories, err := app.sm.RetrieveContext(ctx, sid, query, limit)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to retrieve memories: %v", err)), nil
+		}
+
+		// Build augmented prompt
+		var promptBuilder strings.Builder
+
+		if len(memories) > 0 {
+			promptBuilder.WriteString("# Relevant Context from Memory\n\n")
+			for i, mem := range memories {
+				promptBuilder.WriteString(fmt.Sprintf("## Memory %d (Score: %.3f)\n", i+1, mem.Score))
+				promptBuilder.WriteString(fmt.Sprintf("%s\n\n", mem.Content))
+
+				// Include metadata if present
+				if len(mem.Metadata) > 0 {
+					metaJSON, _ := json.MarshalIndent(mem.Metadata, "", "  ")
+					promptBuilder.WriteString(fmt.Sprintf("Metadata: %s\n\n", string(metaJSON)))
+				}
+			}
+			promptBuilder.WriteString("---\n\n")
+		}
+
+		promptBuilder.WriteString("# User Query\n\n")
+		promptBuilder.WriteString(query)
+
+		result := map[string]any{
+			"session_id":       sid,
+			"query":            query,
+			"memories_found":   len(memories),
+			"augmented_prompt": promptBuilder.String(),
+			"memories":         memories,
+		}
+
+		res, _ := mcp.NewToolResultJSON(result)
+		return res, nil
+	})
+
+	// ---- Tool: agent_mode.set_prompt ----
+	agentModeSet := mcp.NewTool(
+		"agent_mode.set_prompt",
+		mcp.WithDescription("Store or return the Memory-Aware Agent Mode system prompt"),
+		mcp.WithString("session_id", mcp.Required(), mcp.Description("Session to store the agent-mode prompt into")),
+		mcp.WithBoolean("store", mcp.Description("If true, store the prompt in long-term memory")),
+	)
+
+	s.AddTool(agentModeSet, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+
+		sid, _ := req.RequireString("session_id")
+		storeFlag := req.GetBool("store", false)
+
+		promptText := `Before answering any user query, you will always be given an “augmented prompt” that contains:
+- the user’s original query
+- the retrieved memory records
+- metadata associated with those memories
+
+Your primary goal is to answer the user's query directly.
+
+Your behavior:
+
+1. Always incorporate the memory block into your understanding of the current request.
+2. Use the retrieved context to actively influence how you interpret the user’s new prompt, including their intent, preferences, past decisions, and ongoing tasks.
+3. Interpret user queries through the lens of these retrieved memories.
+4. Naturally weave relevant memory information into your reasoning and your final answer.
+5. After receiving the augmented prompt, your next step should be to generate a helpful, user-facing response, not to call another tool unless the user's query explicitly asks for a tool-based action (such as searching, retrieving, saving, or modifying content).
+6. If the memory contradicts the user’s new request, follow the new request but use memory to refine, clarify, or adapt the response.
+7. Do not reveal, mention, or describe anything about retrieval mechanisms (vector search, embeddings, memory-bank, session tools, etc.).
+8. Assume memory is incomplete; infer intent conservatively.
+9. Every answer must be shaped by both the current user query and the retrieved memories included with it.
+10. Never create or request a new session ID if one already exists; always reuse the active session.
+
+The memory block is always part of your input. Treat it as authoritative context for all answers.
+`
+
+		// Optionally store it as long-term memory
+		if storeFlag {
+			meta := map[string]any{
+				"type":  "agent_mode_prompt",
+				"scope": "system",
+			}
+
+			rec, err := app.engine.Store(ctx, sid, promptText, meta)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultJSON(map[string]any{
+				"status":  "stored",
+				"session": sid,
+				"record":  rec,
+			})
+		}
+
+		// Otherwise just return the prompt
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"prompt": promptText,
+			"stored": false,
+		})
 		return res, nil
 	})
 
@@ -806,6 +948,38 @@ func main() {
 		return res, nil
 	})
 
+	// Tool: get_or_create_session
+	getOrCreateSession := mcp.NewTool("get_or_create_session",
+		mcp.WithDescription("Get existing session ID from disk, or create a new one if none exists"),
+	)
+	s.AddTool(getOrCreateSession, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Try to load existing session
+		sessionID, err := loadSessionID()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load session: %v", err)), nil
+		}
+
+		created := false
+		if sessionID == "" {
+			// Create new session if none exists
+			sessionID = fmt.Sprintf("sess-%d", time.Now().UnixNano())
+			if err := saveSessionID(sessionID); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("failed to save session: %v", err)), nil
+			}
+			created = true
+		}
+
+		res, _ := mcp.NewToolResultJSON(map[string]any{
+			"session_id": sessionID,
+			"created":    created,
+			"loaded":     !created,
+		})
+		return res, nil
+	})
+
+	// Update the initialize tool to save the session ID:
+	// Replace your existing initTool with:
+
 	metrics := mcp.NewTool("engine.metrics", mcp.WithDescription("Return engine metrics snapshot")) // This was already correct, but including for completeness
 	s.AddTool(metrics, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		res, _ := mcp.NewToolResultJSON(app.engine.MetricsSnapshot())
@@ -895,4 +1069,66 @@ func isBinaryContent(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// Add these functions to your main.go file
+
+// getSessionDir returns the path to ~/.memory-bank-mcp directory
+func getSessionDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(home, ".memory-bank-mcp"), nil
+}
+
+// ensureSessionDir creates the session directory if it doesn't exist
+func ensureSessionDir() (string, error) {
+	dir, err := getSessionDir()
+	if err != nil {
+		return "", err
+	}
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create session directory: %w", err)
+	}
+
+	return dir, nil
+}
+
+// saveSessionID persists the session ID to disk
+func saveSessionID(sessionID string) error {
+	dir, err := ensureSessionDir()
+	if err != nil {
+		return err
+	}
+
+	filePath := filepath.Join(dir, "session_id")
+	if err := os.WriteFile(filePath, []byte(sessionID), 0644); err != nil {
+		return fmt.Errorf("failed to write session ID: %w", err)
+	}
+
+	log.Printf("Saved session ID to %s", filePath)
+	return nil
+}
+
+// loadSessionID retrieves the session ID from disk, returns empty string if not found
+func loadSessionID() (string, error) {
+	dir, err := getSessionDir()
+	if err != nil {
+		return "", err
+	}
+
+	filePath := filepath.Join(dir, "session_id")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // Not an error, just no saved session
+		}
+		return "", fmt.Errorf("failed to read session ID: %w", err)
+	}
+
+	sessionID := strings.TrimSpace(string(data))
+	log.Printf("Loaded session ID from %s", filePath)
+	return sessionID, nil
 }
